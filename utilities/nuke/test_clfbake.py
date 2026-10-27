@@ -1,0 +1,176 @@
+"""Headless verification of CLFBake.nk against the OpenDRT Nuke node.
+
+    rez-env nuke fxphd -- nuke -t test_clfbake.py
+    CLFBAKE_PRESET=8 rez-env nuke fxphd -- nuke -t test_clfbake.py   # other shaper presets
+
+Builds: test image -> CLFShaper -> OpenDRT -> CLFGenerate, presses Generate,
+then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
+  1. on the lattice (pattern mode) the match must be exact (shaper + LUT agree),
+  2. off the lattice (real image) the match must be within 3D LUT interpolation
+     error,
+  3. a log-input CLF applied to log-encoded values matches too,
+  4. Restore applies the recorded OpenDRT parameters to a fresh node,
+  5. the same bake written as CTF loads.
+Exits non-zero on failure.
+"""
+import math
+import os
+import sys
+import tempfile
+
+import nuke
+import PyOpenColorIO as ocio
+
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
+CLFBAKE = os.path.join(HERE, 'CLFBake.nk')
+OPENDRT = os.path.join(ROOT, 'display-transforms', 'opendrt', 'OpenDRT.nk')
+OUT = tempfile.mkdtemp(prefix='clfbake_test_')
+PRESET = int(os.environ.get('CLFBAKE_PRESET', '0'))  # nuke -t eats numeric argv as a frame range
+W = H = 24
+LATTICE_TOL = 2e-4
+IMAGE_TOL = 3e-2  # 48^3 tetrahedral interpolation of a DRT, display code values
+
+failures = []
+
+
+def check(name, err, tol):
+    ok = err <= tol
+    print('%s %-34s max err %.3e (tol %.0e)' % ('PASS' if ok else 'FAIL', name, err, tol))
+    if not ok:
+        failures.append(name)
+
+
+def paste(path):
+    before = set(nuke.allNodes())
+    nuke.nodePaste(path)
+    new = [n for n in nuke.allNodes() if n not in before]
+    for n in new:
+        n.setSelected(False)
+    return new
+
+
+def sample(node, w, h):
+    out = []
+    for y in range(h):
+        for x in range(w):
+            out.append([node.sample(c, x + 0.5, y + 0.5) for c in ('red', 'green', 'blue')])
+    return out
+
+
+def max_err(a, b):
+    return max(abs(p - q) for pa, pb in zip(a, b) for p, q in zip(pa, pb))
+
+
+def apply_clf(path, pixels):
+    cfg = ocio.Config.CreateRaw()
+    cpu = cfg.getProcessor(ocio.FileTransform(src=path)).getDefaultCPUProcessor()
+    return [cpu.applyRGB(list(p)) for p in pixels]
+
+
+def lin_to_log(shaper, v):
+    gs, go, ls, lo, lb, sl = [shaper[k].value() for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl')]
+    logbreak = gs * math.log(ls * lb + lo, 2) + go
+    if v < lb:
+        return sl * v + (logbreak - sl * lb)
+    return gs * math.log(ls * v + lo, 2) + go
+
+
+def log_to_lin(shaper, y):
+    gs, go, ls, lo, lb, sl = [shaper[k].value() for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl')]
+    logbreak = gs * math.log(ls * lb + lo, 2) + go
+    if y <= logbreak:
+        return (y - (logbreak - sl * lb)) / sl
+    return (2.0 ** ((y - go) / gs) - lo) / ls
+
+
+# --- scene -----------------------------------------------------------------
+nuke.addFormat('%d %d 0 0 %d %d 1 clfbake_test' % (W, H, W, H))
+nuke.root()['format'].setValue('clfbake_test')
+
+shaper, gen = paste(CLFBAKE)
+if 'clfbake_shaper' not in shaper.knobs():
+    shaper, gen = gen, shaper
+drt = paste(OPENDRT)[0]
+shaper['preset'].setValue(PRESET)
+shaper['cube_size'].setValue(48)
+
+# test image spanning the shaper's own domain: 24 stops below its top, and
+# negatives down to half of what the linear toe admits
+hi, lo = log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0)
+img = nuke.nodes.Expression(name='TestImage')
+img['expr0'].setValue('%r*pow(2,24*(x/width-1))' % hi)
+img['expr1'].setValue('%r*pow(2,24*(y/height-1))' % hi)
+img['expr2'].setValue('0.5*(r+g)*(0.5+0.5*sin(x*0.7+y*0.3))+%r' % (0.5 * lo))
+shaper.setInput(0, img)
+drt.setInput(0, shaper)
+gen.setInput(0, drt)
+print('nuke:', nuke.NUKE_VERSION_STRING, ' ocio:', ocio.__version__,
+      ' preset:', shaper['preset'].value(), ' domain: %.4g .. %.4g' % (lo, hi), ' node:', drt.name())
+
+# a non-default OpenDRT state so Restore has something to prove
+drt['tn_con'].setValue(1.6)
+drt['hs_r'].setValue(0.21)
+drt['brl_enable'].setValue(False)
+drt['tn_Lp'].setValue(200)
+drt['display_name'].setValue('clfbake test')
+
+# --- 1. lattice exactness --------------------------------------------------
+clf = os.path.join(OUT, 'test.clf')
+gen['file'].setValue(clf)
+gen['generate'].execute()
+print('status:', gen['status'].value())
+assert os.path.exists(clf), clf
+assert not shaper['pattern'].value(), 'pattern mode left on'
+
+shaper['pattern'].setValue(True)
+lin = sample(shaper, W, H)       # linear lattice samples (inverse shaper output)
+nuke_out = sample(gen, W, H)     # what the chain renders for them
+shaper['pattern'].setValue(False)
+check('lattice: CLF vs Nuke', max_err(apply_clf(clf, lin), nuke_out), LATTICE_TOL)
+
+# --- 2. real image ----------------------------------------------------------
+lin = sample(img, W, H)
+nuke_out = sample(gen, W, H)
+check('image: CLF vs Nuke', max_err(apply_clf(clf, lin), nuke_out), IMAGE_TOL)
+
+# --- 3. log input -------------------------------------------------------------
+clf_log = os.path.join(OUT, 'test_log.clf')
+gen['file'].setValue(clf_log)
+gen['log_input'].setValue(True)
+gen['generate'].execute()
+gen['log_input'].setValue(False)
+logpix = [[lin_to_log(shaper, c) for c in p] for p in lin]
+check('log input: CLF vs Nuke', max_err(apply_clf(clf_log, logpix), nuke_out), IMAGE_TOL)
+txt = open(clf_log).read()
+assert '<Log ' not in txt, 'log-input CLF must not embed the shaper'
+assert '<Log ' in open(clf).read(), 'linear CLF must embed the shaper'
+
+# --- 4. restore ---------------------------------------------------------------
+fresh = paste(OPENDRT)[0]
+knobs = drt['look_preset_knobs'].value().split() + ['tn_Lp', 'tn_Lg', 'tn_gb', 'pt_hdr', 'eotf',
+                                                   'display_gamut', 'clamp', 'display_name', 'in_gamut']
+differs = [k for k in knobs if drt[k].toScript() != fresh[k].toScript()]
+assert differs, 'fresh node already matches, restore proves nothing'
+gen['file'].setValue(clf)
+for n in nuke.allNodes():
+    n.setSelected(n is fresh)
+gen['restore'].execute()
+print('status:', gen['status'].value())
+bad = [k for k in knobs if drt[k].toScript() != fresh[k].toScript()]
+print('%s restore: %d knobs compared, %d differed before, %d differ after %s'
+      % ('PASS' if not bad else 'FAIL', len(knobs), len(differs), len(bad), bad))
+if bad:
+    failures.append('restore')
+
+# --- 5. CTF -------------------------------------------------------------------
+ctf = os.path.join(OUT, 'test.ctf')
+gen['file'].setValue(ctf)
+gen['generate'].execute()
+check('ctf: CLF vs CTF', max_err(apply_clf(ctf, lin), apply_clf(clf, lin)), 1e-6)
+
+print('outputs in', OUT)
+if failures:
+    print('FAILED:', failures)
+    sys.exit(1)
+print('ALL PASS')

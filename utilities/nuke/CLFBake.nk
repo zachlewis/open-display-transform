@@ -1,0 +1,108 @@
+set cut_paste_input [stack 0]
+push $cut_paste_input
+Group {
+ name CLFShaper
+ knobChanged "n = nuke.thisNode()\nif nuke.thisKnob().name() in ('preset', 'showPanel'):\n    x = n\['preset'].getValue() == 8\n    for k in ('w0', 'o', 'x0', 'y0', 'k'):\n        n\[k].setVisible(x)\n"
+ tile_color 0x4a3a7aff
+ label "\[value preset]"
+ xpos 0
+ addUserKnob {20 CLFShaper}
+ addUserKnob {26 about l " " T "<font color=#ccc><b>CLFShaper</b> | part of <a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>Place at the head of the chain to bake. CLFGenerate goes at the tail."}
+ addUserKnob {4 preset l shaper t "Log encoding used to shape the 3D LUT domain. The exact same curve is written into the CLF as a parametric Log node, so the LUT takes linear input. T-LogE is what the released OpenDRT OCIO config uses." M {"Filmlight T-LogE" "Filmlight T-Log" ACEScct "Arri LogC3" "Arri LogC4" "Sony S-Log3" "Red Log3G10" "DaVinci Intermediate" XLog}}
+ addUserKnob {7 w0 t "XLog: linear value that maps to 1.0" +HIDDEN R 10 256}
+ w0 128
+ addUserKnob {7 o t "XLog: log asymptote offset, as 2^-o" +HIDDEN R 0 12}
+ o 7.5
+ addUserKnob {7 x0 t "XLog: lower intersection constraint x" +HIDDEN R 0 0.5}
+ addUserKnob {7 y0 t "XLog: lower intersection constraint y" +HIDDEN R 0 0.5}
+ y0 0.075
+ addUserKnob {7 k t "XLog: slope of the linear extension" +HIDDEN R 0 0.2}
+ k 0.06
+ addUserKnob {3 cube_size l "cube size" t "3D LUT lattice size. 48 matches the released OpenDRT OCIO config. CLF allows up to 128."}
+ cube_size 48
+ addUserKnob {6 pattern l "show pattern" t "Output the shaped CMSTestPattern instead of the input. CLFGenerate toggles this while baking." +STARTLINE}
+ addUserKnob {20 Params}
+ addUserKnob {7 o0 t "x offset: the y asymptote of the log curve" +DISABLED}
+ o0 {{-(2**-o)}}
+ addUserKnob {7 s0 t "s0 = scale factor to satisfy intersection constraint at (x0, y0)" +DISABLED}
+ s0 {{(1-y0)/log((w0-o0)/(x0-o0))}}
+ addUserKnob {7 o1 t "y offset to satisfy intersection constraint at (w0, 1)" +DISABLED}
+ o1 {{1-s0*log(w0-o0)}}
+ addUserKnob {7 x1 t "x1 is x coordinate of linear extension intercept" +DISABLED}
+ x1 {{s0*log(k*s0*exp(o1/s0))}}
+ addUserKnob {7 y1 t "y1 is y coordinate of linear extension intercept" +DISABLED}
+ y1 {{exp((x1-o1)/s0)+o0}}
+ addUserKnob {26 div1 l "" +STARTLINE}
+ addUserKnob {7 gs l logSideSlope t "OCIO LogCameraTransform logSideSlope (base 2)" +DISABLED}
+ gs {{preset==0?0.055459048831000002:(preset==1?0.063997604032021899:(preset==2?0.057077625570776301:(preset==3?0.074411604628179501:(preset==4?0.064795419634129298:(preset==5?0.076949505245484703:(preset==6?0.067515609487508996:(preset==7?0.073292479999999993:(s0*log(2)))))))))}}
+ addUserKnob {7 go l logSideOffset t "OCIO LogCameraTransform logSideOffset" +DISABLED}
+ go {{preset==0?0.50086779795500003:(preset==1?0.55201265686066503:(preset==2?0.55479452054794498:(preset==3?0.38553700000000002:(preset==4?-0.29590839268258601:(preset==5?0.410557184750733:(preset==6?0:(preset==7?0.51304735999999995:(o1))))))))}}
+ addUserKnob {7 ls l linSideSlope t "OCIO LogCameraTransform linSideSlope" +DISABLED}
+ ls {{preset==0?1:(preset==1?1:(preset==2?1:(preset==3?5.5555560000000002:(preset==4?2231.8263090676901:(preset==5?5.2631578947368398:(preset==6?155.97532699999999:(preset==7?1:(1))))))))}}
+ addUserKnob {7 lo l linSideOffset t "OCIO LogCameraTransform linSideOffset" +DISABLED}
+ lo {{preset==0?0.0048798088598100003:(preset==1?0.0057048244042473802:(preset==2?0:(preset==3?0.052271999999999999:(preset==4?64:(preset==5?0.052631578947368397:(preset==6?2.5597532699999999:(preset==7?0.0074999999999999997:(-o0))))))))}}
+ addUserKnob {7 lb l linSideBreak t "OCIO LogCameraTransform linSideBreak" +DISABLED}
+ lb {{preset==0?0:(preset==1?0:(preset==2?0.0078125:(preset==3?0.010591:(preset==4?-0.018056996119911298:(preset==5?0.01125:(preset==6?-0.01:(preset==7?0.0026240899999999999:(y1))))))))}}
+ addUserKnob {7 sl l linearSlope t "OCIO LogCameraTransform linearSlope" +DISABLED}
+ sl {{preset==0?16.396235389436512:(preset==1?16.184376489665894:(preset==2?10.540237741654536:(preset==3?5.3676735864473013:(preset==4?8.8030332103317619:(preset==5?6.6219437117758204:(preset==6?15.192688598850596:(preset==7?10.444266835878933:(1/k))))))))}}
+ addUserKnob {7 logbreak l "log break" t "log-side value at the break" +DISABLED}
+ logbreak {{gs*log(ls*lb+lo)/log(2)+go}}
+ addUserKnob {7 linoff l "linear offset" t "offset of the linear segment" +DISABLED}
+ linoff {{logbreak-sl*lb}}
+ addUserKnob {1 clfbake_shaper l "" +STARTLINE +INVISIBLE}
+ clfbake_shaper 1
+}
+ CMSTestPattern {
+  inputs 0
+  cube_size {{parent.cube_size}}
+  name CMSTestPattern1
+ }
+ Expression {
+  expr0 r<=parent.logbreak?(r-parent.linoff)/parent.sl:(pow(2,(r-parent.go)/parent.gs)-parent.lo)/parent.ls
+  expr1 g<=parent.logbreak?(g-parent.linoff)/parent.sl:(pow(2,(g-parent.go)/parent.gs)-parent.lo)/parent.ls
+  expr2 b<=parent.logbreak?(b-parent.linoff)/parent.sl:(pow(2,(b-parent.go)/parent.gs)-parent.lo)/parent.ls
+  name InverseShaper
+ }
+ Input {
+  inputs 0
+  name Input1
+ }
+ Switch {
+  inputs 2
+  which {{parent.pattern}}
+  name Switch1
+ }
+ Output {
+  name Output1
+ }
+end_group
+Group {
+ name CLFGenerate
+ tile_color 0x4a3a7aff
+ xpos 0
+ ypos 200
+ addUserKnob {20 CLFGenerate}
+ addUserKnob {26 about l " " T "<font color=#ccc><b>CLFGenerate</b> | part of <a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>Bakes everything between the upstream CLFShaper and this node into a CLF."}
+ addUserKnob {2 file t "Output path. Use a .ctf extension to write CTF instead of CLF. Empty: next to the script, named after the baked node."}
+ addUserKnob {4 interpolation t "Interpolation recorded in the LUT3D node." M {tetrahedral trilinear}}
+ addUserKnob {6 log_input l "log input" t "Omit the shaper from the CLF so it takes the shaper log encoding as input, the way the released OpenDRT OCIO config consumes its cubes. Default off: the shaper is embedded and the CLF takes linear input." -STARTLINE}
+ addUserKnob {22 generate l Generate t "Bake the chain to a 3D LUT via GenerateLUT, then write the CLF with the shaper and node parameters embedded." T "import os, datetime, tempfile\nimport nuke\nimport PyOpenColorIO as ocio\n\ngen = nuke.thisNode()\nMARK = 'clfbake_shaper'\nSHORT = \['tloge', 'tlog', 'acescct', 'logc3', 'logc4', 'slog3', 'log3g10', 'davinci_intermediate', 'xlog']\nSKIP_CLASSES = ('Tab_Knob', 'Text_Knob', 'PyScript_Knob', 'Script_Knob',\n                'Obsolete_Knob', 'Pulldown_Knob', 'Help_Knob',\n                'BeginTabGroup_Knob', 'EndTabGroup_Knob')\nSKIP_NAMES = ('name', 'xpos', 'ypos', 'selected', 'tile_color', 'note_font',\n              'note_font_size', 'note_font_color', 'hide_input', 'cached',\n              'dope_sheet', 'bookmark', 'postage_stamp', 'postage_stamp_frame',\n              'gl_color', 'icon', 'indicators', 'knobChanged', 'onCreate',\n              'onDestroy', 'updateUI', 'autolabel', 'panel', 'lifetimeStart',\n              'lifetimeEnd', 'useLifetime', 'lock_connections', 'help',\n              'mapsize', 'window', 'rootNodeUpdated', 'process_mask',\n              'disable', 'label', 'group_view_position', 'show_group_view',\n              'disable_group_view')\n\n\ndef chain():\n    nodes, n = \[], gen.input(0)\n    while n is not None:\n        if MARK in n.knobs():\n            return n, nodes\n        nodes.append(n)\n        n = n.input(0)\n    raise RuntimeError('No CLFShaper found upstream of %s' % gen.name())\n\n\ndef knob_values(n):\n    out = \[]\n    for name in n.knobs():\n        if name in SKIP_NAMES:\n            continue\n        try:\n            k = n\[name]\n        except Exception:\n            continue\n        if k.Class() in SKIP_CLASSES:\n            continue\n        try:\n            out.append((name, k.toScript()))\n        except Exception:\n            pass\n    return out\n\n\ndef child(md, name, value=''):\n    md.addChildElement(name, value)\n    return list(md.getChildElements())\[-1]\n\n\nshaper, nodes = chain()\nif not nodes:\n    raise RuntimeError('Nothing between %s and %s to bake' % (shaper.name(), gen.name()))\npreset = shaper\['preset'].value()\nshort = SHORT\[int(shaper\['preset'].getValue())]\npar = dict((k, shaper\[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl'))\nsize = int(shaper\['cube_size'].value())\nlog_input = bool(gen\['log_input'].value())\n\npath = gen\['file'].evaluate()\nif not path:\n    root = nuke.root().name()\n    d = os.path.dirname(root) if root and root != 'Root' else tempfile.gettempdir()\n    path = os.path.join(d, '%s__%s.clf' % (nodes\[-1].name(), short))\n    gen\['file'].setValue(path.replace(os.sep, '/'))\next = os.path.splitext(path)\[1].lower()\nfmt = 'Color Transform Format' if ext == '.ctf' else 'Academy/ASC Common LUT Format'\n\n# 1. bake the shaped test pattern through the chain with Nuke's GenerateLUT\ntmp = os.path.join(tempfile.gettempdir(), 'clfbake_%s_%d.cube' % (gen.name(), os.getpid()))\ngen\['tmp_cube'].setValue(tmp.replace(os.sep, '/'))\nshaper\['pattern'].setValue(True)\ntry:\n    f = nuke.frame()\n    nuke.execute(gen.node('GenerateLUT1'), f, f)\nfinally:\n    shaper\['pattern'].setValue(False)\n\n# 2. wrap it in a CLF: parametric shaper + LUT3D + metadata\ncfg = ocio.Config.CreateRaw()\nproc = cfg.getProcessor(ocio.FileTransform(src=tmp))\nlut = None\nfor t in proc.getOptimizedProcessor(ocio.OPTIMIZATION_NONE).createGroupTransform():\n    if isinstance(t, ocio.Lut3DTransform):\n        lut = t\nif lut is None:\n    raise RuntimeError('GenerateLUT did not produce a 3D LUT: %s' % tmp)\nlut.setInterpolation(ocio.INTERP_TETRAHEDRAL if gen\['interpolation'].value() == 'tetrahedral'\n                     else ocio.INTERP_LINEAR)\ngrp = ocio.GroupTransform()\nif not log_input:\n    grp.appendTransform(ocio.LogCameraTransform(\n        base=2.0, linSideBreak=\[par\['lb']] * 3,\n        logSideSlope=\[par\['gs']] * 3, logSideOffset=\[par\['go']] * 3,\n        linSideSlope=\[par\['ls']] * 3, linSideOffset=\[par\['lo']] * 3,\n        linearSlope=\[par\['sl']] * 3))\ngrp.appendTransform(lut)\n\nmd = grp.getFormatMetadata()\nmd.setID('%s__%s' % (nodes\[-1].name(), short))\nmd.setName(nodes\[-1].name())\nchild(md, 'InputDescriptor', preset if log_input else 'Linear (%s shaper)' % preset)\nchild(md, 'OutputDescriptor', nodes\[-1].name())\nnb = child(child(md, 'Info'), 'NukeBake')\nnb\['version'] = '1'\nsh = child(nb, 'Shaper')\nsh\['preset'] = preset\nsh\['shortname'] = short\nsh\['cube_size'] = str(size)\nsh\['embedded'] = 'false' if log_input else 'true'\nfor k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl'):\n    sh\[k] = repr(par\[k])\nfor k in ('w0', 'o', 'x0', 'y0', 'k'):\n    sh\[k] = repr(shaper\[k].value())\nns = child(nb, 'Nodes')\nfor n in nodes:\n    e = child(ns, 'Node')\n    e\['class'] = n.Class()\n    e\['name'] = n.name()\n    for name, val in knob_values(n):\n        child(e, 'Knob', val)\['name'] = name\ng = child(nb, 'Generator')\ng\['nuke'] = nuke.NUKE_VERSION_STRING\ng\['ocio'] = ocio.__version__\ng\['date'] = datetime.datetime.now().isoformat(timespec='seconds')\ng\['script'] = nuke.root().name()\ngrp.write(config=cfg, formatName=fmt, fileName=path)\ntry:\n    os.remove(tmp)\nexcept OSError:\n    pass\ngen\['status'].setValue('wrote %s (%d nodes, %d^3, %s)' % (\n    os.path.basename(path), len(nodes), size, 'log input' if log_input else short))\n" +STARTLINE}
+ addUserKnob {22 restore l Restore t "Read the CLF and apply the recorded parameters to the selected nodes (or to the upstream chain if nothing is selected)." -STARTLINE T "import xml.etree.ElementTree as ET\nimport nuke\n\ngen = nuke.thisNode()\nMARK = 'clfbake_shaper'\npath = gen\['file'].evaluate()\nroot = ET.parse(path).getroot()\n\n\ndef tag(e):\n    return e.tag.split('\}')\[-1]\n\n\ndef find(e, name):\n    for c in e.iter():\n        if tag(c) == name:\n            return c\n\n\nnb = find(root, 'NukeBake')\nif nb is None:\n    raise RuntimeError('%s has no NukeBake metadata' % path)\n\ntargets = \[n for n in nuke.thisParent().nodes() if n.isSelected()]\nif not targets:\n    targets, n = \[], gen.input(0)\n    while n is not None:\n        targets.append(n)\n        if MARK in n.knobs():\n            break\n        n = n.input(0)\ntargets = list(targets)\ndone = \[]\n\nsh = find(nb, 'Shaper')\nfor t in targets:\n    if sh is not None and MARK in t.knobs():\n        t\['preset'].setValue(sh.get('preset'))\n        for k in ('w0', 'o', 'x0', 'y0', 'k'):\n            if sh.get(k) is not None:\n                t\[k].setValue(float(sh.get(k)))\n        t\['cube_size'].setValue(int(sh.get('cube_size', 48)))\n        gen\['log_input'].setValue(sh.get('embedded') == 'false')\n        done.append(t.name())\n        targets.remove(t)\n        break\n\nfor e in find(nb, 'Nodes') or \[]:\n    cls = e.get('class')\n    match = None\n    for t in targets:\n        if t.Class() == cls:\n            match = t\n            break\n    if match is None:\n        continue\n    targets.remove(match)\n    for k in e:\n        name = k.get('name')\n        if name in match.knobs():\n            try:\n                match\[name].fromScript(k.text or '')\n            except Exception:\n                pass\n    done.append('%s <- %s' % (match.name(), e.get('name')))\n\ngen\['status'].setValue('restored: %s' % (', '.join(done) or 'nothing matched (select the nodes to restore)'))\n"}
+ addUserKnob {26 status l " "}
+ addUserKnob {1 tmp_cube l "" +STARTLINE +INVISIBLE}
+}
+ Input {
+  inputs 0
+  name Input1
+ }
+set N9d06c500 [stack 0]
+ GenerateLUT {
+  file "\[value parent.tmp_cube]"
+  file_type .cube
+  name GenerateLUT1
+ }
+push $N9d06c500
+ Output {
+  name Output1
+ }
+end_group
