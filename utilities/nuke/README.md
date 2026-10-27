@@ -37,6 +37,7 @@ chain as linear.
 | file | Output path. A `.ctf` extension writes CTF instead of CLF. Empty: next to the script, named `<node>__<shaper>.clf`. |
 | interpolation | Recorded in the LUT3D node. Tetrahedral by default. |
 | log input | Omit the Log node and declare the shaper's log encoding as the input, the way the released OpenDRT config consumes its cubes. Off by default: the shaper is embedded and the CLF takes linear input. |
+| embed node script | Also store the baked nodes as a Nuke script in the CLF so From CLF can rebuild them. On by default; the structured metadata is written regardless. |
 | domain | **preset**: use the shaper as set. **auto**: probe the chain and replace the preset with a fitted XLog only if the chain still changes beyond the preset's range. **fit**: always fit. See below. |
 | Generate | Bake. The status line reports the file, node count, lattice size, and what auto/fit decided. |
 | Restore | Apply the knob values recorded in `file` to the selected nodes of the same class, or to the upstream chain when nothing is selected. |
@@ -69,16 +70,36 @@ domain fitting, or a chain of nodes.
   <InputDescriptor>Linear (Filmlight T-LogE shaper)</InputDescriptor>
   <OutputDescriptor>OpenDRT</OutputDescriptor>
   <Info>
-    <NukeBake version="1">
+    <NukeBake version="2">
       <Shaper preset="Filmlight T-LogE" shortname="tloge" cube_size="48" embedded="true"
               gs=".." go=".." ls=".." lo=".." lb=".." sl=".."  w0=".." o=".." x0=".." y0=".." k=".."/>
-      <Nodes>
+      <Nodes>                                      <!-- generic: every node, every user-facing knob -->
         <Node class="Group" name="OpenDRT">
-          <Knob name="tn_Lp">100</Knob>          <!-- every user-facing knob, via toScript -->
+          <Knob name="tn_Lp">100</Knob>            <!-- Nuke toScript form, restored with fromScript -->
           ...
         </Node>
       </Nodes>
-      <Script>...the baked nodes as a .nk snippet (nuke.nodeCopy), for From CLF...</Script>
+      <Model name="OpenDRT" version="1.1.0" node="OpenDRT" look="Standard">   <!-- recognised models only -->
+        <Input in_gamut="Filmlight E-Gamut2" in_gamut_index="10"/>
+        <Tonescale tn_Lp="100.0" tn_Lg="10.0" tn_gb="0.13" tn_con="1.66" tn_sh="0.5" tn_toe="0.003"
+                   tn_off="0.005" tn_su="dim" tn_su_index="1"/>
+        <HighContrast .../> <LowContrast .../> <CreativeWhite cwp="D65" cwp_index="2" cwp_lm="0.25"/>
+        <RenderSpace .../> <PurityCompress .../> <PuritySoftclip .../> <MidPurity .../>
+        <Brilliance .../> <PostBrilliance .../> <HueContrast .../> <HueShiftRGB .../> <HueShiftCMY .../>
+        <Output eotf="2.4 Power - Rec.1886" eotf_index="2" display_gamut="Rec.709" display_gamut_index="0"
+                clamp="true" display_name="Rec.1886 - 2.4 Power / Rec.709"/>
+      </Model>
+      <Mastering>
+        <DisplayColorVolume gamut="Rec.709" maxLuminance="100.0" minLuminance="0.0"
+                            red="0.64 0.33" green="0.3 0.6" blue="0.15 0.06" white="0.3127 0.329"/>
+        <Luminance peak="100.0" greyNominal="10" greyMeasured="11.5" diffuseWhiteMeasured="50.5"
+                   measuredFrom="chain output for neutral 0.18 and 1.0, decoded with the output EOTF"/>
+        <ViewingEnvironment surround="dim" ambient="video, 5 nit surround"/>
+        <CreativeWhite whitepoint="D65" limit="0.25"/>
+        <CICP primaries="1" transfer="1" matrix="0" fullRange="true" note="..."/>
+      </Mastering>
+      <Interop input="lin_ap1_scene" output="g24_rec709_display"/>
+      <Script>...the baked nodes as a .nk snippet (nuke.nodeCopy), for From CLF; optional...</Script>
       <Generator nuke="16.0v4" date="..." script="..."/>
     </NukeBake>
   </Info>
@@ -97,6 +118,36 @@ logSideOffset, linSideSlope, linSideOffset, linSideBreak, linearSlope), base 2.
 Knob values are Nuke's `toScript` form and are restored with `fromScript`, so
 enumerations, arrays, expressions and Link knobs round-trip. The bake path is
 never recorded. A CTF differs only in the root attributes (`version="2"`).
+
+**Model** is written for nodes the tool recognises (today: OpenDRT v1.x, by
+its knob set). Attribute names are the model's own parameter identifiers, the
+same ones the Nuke node, the DCTL's `DEFINE_UI_PARAMS(_<id>, …)` and Jed's
+preset strings use, so a Nuke preset, a DCTL preset block or a JSON document
+can be generated from it mechanically; enumerations carry the label and
+`<id>_index` for integer targets. Values are as set, not defaults-only.
+
+**Mastering** describes the output the transform was authored for:
+`DisplayColorVolume` in SMPTE ST 2086 terms (CIE xy primaries and white,
+min/max luminance; Rec.2020 (P3 Limited) also states `limitedTo`),
+`Luminance` with `greyNominal` (grey luminance with HDR grey boost, before
+surround compensation) and `greyMeasured` / `diffuseWhiteMeasured`, which are
+sampled from the live chain during the bake for neutral 0.18 and 1.0 and
+decoded through the output EOTF (so they are the truth, and dim/bright surround
+shows up as grey above nominal), the viewing `surround`, the `CreativeWhite`,
+and the ITU-T H.273 `CICP` code points for the output encoding where they are
+unambiguous (transfer 1 for 2.4-power Rec.1886 is the broadcast convention).
+
+**Interop** carries ASWF Color Interop IDs only where the mapping is exact:
+input from the OpenDRT input gamut when the shaper is embedded (ACES, ACEScg,
+P3-D65, Rec.2020, Rec.709 map; camera gamuts have no published CIID), output
+from the EOTF and display gamut pair (`g24_rec709_display`,
+`pq_rec2020_display`, `hlg_rec2020_display`, …). Display P3 at pure 2.2 power
+and DCDM X'Y'Z' are deliberately unmapped because the published CIIDs mean the
+sRGB piecewise curve and a headroom-scaled DCDM respectively.
+
+Not yet written: the SMPTE CLF broadcast profile metadata ("CLF4"), which
+OpenColorIO implements. That belongs to bakes whose input or output is not
+video levels, and is deferred until there is such a bake.
 
 ## Using the CLF in OCIO
 
@@ -148,6 +199,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | auto keeps a sufficient preset | `domain: auto` leaves a preset alone when it already covers the chain. | exact |
 | fit: CLF vs Nuke, above top, below floor | A fitted XLog matches within interpolation error, clamping beyond the fitted top costs nothing, and the floor is within tolerance. | 3e-2 / 5e-3 / 3e-2 |
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
+| metadata (sdr rec1886, pq rec2020 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP and Interop IDs are right for an SDR and a PQ configuration; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; `embed node script` off omits the script. | exact / 3% |
 
 Reference numbers on the OpenDRT test chain at 48³: lattice 1e-6, image
 7.8e-3, fitted image 9.9e-3. If a change moves these by more than a little,
@@ -199,6 +251,11 @@ Where things live in the builder:
   in a function. `GENERATE` also holds the domain probe and the XLog solve.
 - **Metadata schema**: `write_clf`. Bump `NukeBake version` if you change the
   element structure, and keep `read_bake`/`restore_apply` reading old files.
+- **Model and mastering metadata**: `OPENDRT_MODEL` (module → parameter ids),
+  the `XY`, `INTEROP_IN`, `INTEROP_OUT`, `CICP_*` tables, `to_nits` (output
+  EOTF decode) and `describe_opendrt`. A new OpenDRT version that adds a
+  parameter needs its id added to the module table; a new recognised model
+  needs an `is_<model>` test and a describer called from `write_clf`.
 - **Probe ramps**: the `ProbeRamp` expressions in `build_shaper` and the
   thresholds (`/ 1023.0`, the 5-stop toe guard `2.0 ** -5`) in `GENERATE`.
 

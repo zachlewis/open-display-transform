@@ -288,6 +288,82 @@ def rebake_matches(name, src_clf):
 rebake_matches('standalone', clf)          # T-LogE 48^3, the first bake of this run
 rebake_matches('opendrt button', clf2)     # the OpenDRT button's own bake
 
+# --- 9. model / mastering / interop metadata --------------------------------------
+import xml.etree.ElementTree as ET
+
+
+def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None):
+    nb = ET.parse(path).getroot().find('Info/NukeBake')
+    model, mast, inter = nb.find('Model'), nb.find('Mastering'), nb.find('Interop')
+    problems = []
+    if model is None or model.get('name') != 'OpenDRT' or not model.get('version'):
+        problems.append('Model element')
+    else:
+        ts = model.find('Tonescale')
+        if ts is None or float(ts.get('tn_Lp')) != node['tn_Lp'].value() or ts.get('tn_su') != node['tn_su'].value() \
+                or ts.get('tn_su_index') != str(int(node['tn_su'].getValue())):
+            problems.append('Tonescale ids')
+        # every model attribute is a real knob id with the same value as the node
+        for e in model:
+            for pid, val in e.attrib.items():
+                if pid.endswith('_index'):
+                    continue
+                if pid not in node.knobs():
+                    problems.append('unknown id %s' % pid)
+                elif node[pid].Class() == 'Enumeration_Knob':
+                    if val != node[pid].value():
+                        problems.append('enum %s' % pid)
+                elif node[pid].Class() == 'Boolean_Knob':
+                    if val != ('true' if node[pid].value() else 'false'):
+                        problems.append('bool %s' % pid)
+                elif isinstance(node[pid].value(), float) and float(val) != node[pid].value():
+                    problems.append('value %s' % pid)
+    dcv = mast.find('DisplayColorVolume') if mast is not None else None
+    if dcv is None or float(dcv.get('maxLuminance')) != node['tn_Lp'].value() or not dcv.get('white'):
+        problems.append('DisplayColorVolume')
+    lum = mast.find('Luminance') if mast is not None else None
+    if lum is None or float(lum.get('greyMeasured', 0)) <= 0 or float(lum.get('diffuseWhiteMeasured', 0)) <= 0:
+        problems.append('Luminance measured')
+    elif grey_nits is not None and abs(float(lum.get('greyMeasured')) - grey_nits) > 0.03 * grey_nits:
+        problems.append('greyMeasured %s vs nominal %.3g' % (lum.get('greyMeasured'), grey_nits))
+    cicp = mast.find('CICP') if mast is not None else None
+    if expect_cicp and (cicp is None or (cicp.get('primaries'), cicp.get('transfer')) != expect_cicp):
+        problems.append('CICP')
+    if (inter.get('output') if inter is not None else None) != expect_out:
+        problems.append('Interop output')
+    if (inter.get('input') if inter is not None else None) != in_id:
+        problems.append('Interop input')
+    print('%s metadata (%s)%s' % ('PASS' if not problems else 'FAIL', name, '' if not problems else ': ' + ', '.join(problems)))
+    if problems:
+        failures.append('metadata ' + name)
+
+
+# SDR, default "dim" surround lifts grey above nominal, so only presence is checked
+meta_checks('sdr rec1886', clf, drt, 'g24_rec709_display', ('1', '1'), None)
+# PQ Rec.2100 1000 nit on a fresh node, with a mappable input gamut
+d4 = paste(OPENDRT)[0]
+d4.setInput(0, img)
+d4['eotf'].setValue('PQ')
+d4['display_gamut'].setValue('Rec.2020 (P3 Limited)')
+d4['tn_Lp'].setValue(1000)
+d4['tn_su'].setValue('dark')
+d4['in_gamut'].setValue('ACEScg')
+for n in nuke.allNodes():
+    n.setSelected(False)
+s3, g3 = paste(CLFBAKE)
+if 'clfbake_shaper' not in s3.knobs():
+    s3, g3 = g3, s3
+s3.setInput(0, img)
+d4.setInput(0, s3)
+g3.setInput(0, d4)
+g3['embed_script'].setValue(False)
+clf_pq = os.path.join(OUT, 'test_pq.clf')
+g3['file'].setValue(clf_pq)
+g3['generate'].execute()
+assert '<Script>' not in open(clf_pq).read(), 'embed_script off must omit the script'
+meta_checks('pq rec2020 1000nit', clf_pq, d4, 'pq_rec2020_display', ('9', '16'),
+            d4['tn_Lg'].value() * (1 + d4['tn_gb'].value() * math.log(10, 2)), in_id='lin_ap1_scene')
+
 print('outputs in', OUT)
 if failures:
     print('FAILED:', failures)

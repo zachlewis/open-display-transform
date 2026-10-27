@@ -148,8 +148,144 @@ def chain_script(nodes):
     return '\n'.join(l for l in txt.splitlines() if not l.strip().startswith('clf_file ')) + '\n'
 
 
-def write_clf(path, cube, shaper, nodes, interpolation, log_input):
-    """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k)."""
+# --- structured description of recognised models -------------------------------
+# OpenDRT v1.x: one element per module; attribute names are the model's own
+# parameter identifiers, shared by the Nuke node, the DCTL (DEFINE_UI_PARAMS
+# _<id>) and Jed's preset strings, so any of those can be generated from this.
+# Enumerations carry the label plus <id>_index for integer-based targets.
+OPENDRT_MODEL = (
+    ('Input', ('in_gamut',)),
+    ('Tonescale', ('tn_Lp', 'tn_Lg', 'tn_gb', 'tn_con', 'tn_sh', 'tn_toe', 'tn_off', 'tn_su')),
+    ('HighContrast', ('tn_hcon_enable', 'tn_hcon', 'tn_hcon_pv', 'tn_hcon_st')),
+    ('LowContrast', ('tn_lcon_enable', 'tn_lcon', 'tn_lcon_w')),
+    ('CreativeWhite', ('cwp', 'cwp_lm')),
+    ('RenderSpace', ('rs_sa', 'rs_rw', 'rs_bw')),
+    ('PurityCompress', ('pt_enable', 'pt_hdr', 'pt_lml', 'pt_lml_r', 'pt_lml_g', 'pt_lml_b',
+                        'pt_lmh', 'pt_lmh_r', 'pt_lmh_b')),
+    ('PuritySoftclip', ('ptl_enable', 'ptl_c', 'ptl_m', 'ptl_y')),
+    ('MidPurity', ('ptm_enable', 'ptm_low', 'ptm_low_rng', 'ptm_low_st', 'ptm_high', 'ptm_high_rng',
+                   'ptm_high_st')),
+    ('Brilliance', ('brl_enable', 'brl', 'brl_r', 'brl_g', 'brl_b', 'brl_rng', 'brl_st')),
+    ('PostBrilliance', ('brlp_enable', 'brlp', 'brlp_r', 'brlp_g', 'brlp_b')),
+    ('HueContrast', ('hc_enable', 'hc_r', 'hc_r_rng')),
+    ('HueShiftRGB', ('hs_rgb_enable', 'hs_r', 'hs_r_rng', 'hs_g', 'hs_g_rng', 'hs_b', 'hs_b_rng')),
+    ('HueShiftCMY', ('hs_cmy_enable', 'hs_c', 'hs_c_rng', 'hs_m', 'hs_m_rng', 'hs_y', 'hs_y_rng')),
+    ('Output', ('eotf', 'display_gamut', 'clamp', 'display_name')),
+)
+# CIE xy of the OpenDRT display gamuts: (R, G, B, white), ST 2086 style
+XY = {
+    'Rec.709': ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06), (0.3127, 0.3290)),
+    'P3-D65': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.3127, 0.3290)),
+    'Rec.2020 (P3 Limited)': ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), (0.3127, 0.3290)),
+    'P3-D60': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.32168, 0.33767)),
+    'P3-DCI': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.314, 0.351)),
+}
+# Color Interop IDs (ASWF CIF Rec 01 / Rec 02) where the mapping is exact. Everything else is omitted.
+INTEROP_IN = {'ACES': 'lin_ap0_scene', 'ACEScg': 'lin_ap1_scene', 'P3D65': 'lin_p3d65_scene',
+              'Rec.2020': 'lin_rec2020_scene', 'Rec.709': 'lin_rec709_scene'}
+INTEROP_OUT = {
+    ('2.4 Power - Rec.1886', 'Rec.709'): 'g24_rec709_display',
+    ('2.2 Power - sRGB Display', 'Rec.709'): 'g22_rec709_display',
+    ('2.6 Power DCI', 'P3-D65'): 'g26_p3d65_display',
+    ('PQ', 'Rec.2020 (P3 Limited)'): 'pq_rec2020_display',
+    ('PQ', 'P3-D65'): 'pq_p3d65_display',
+    ('HLG', 'Rec.2020 (P3 Limited)'): 'hlg_rec2020_display',
+    ('Linear', 'Rec.709'): 'lin_rec709_display',
+    ('Linear', 'P3-D65'): 'lin_p3d65_display',
+    ('Linear', 'Rec.2020 (P3 Limited)'): 'lin_rec2020_display',
+}
+# ITU-T H.273 code points for the output encoding (RGB, full range)
+CICP_PRIMARIES = {'Rec.709': 1, 'P3-D65': 12, 'Rec.2020 (P3 Limited)': 9, 'P3-DCI': 11, "X'Y'Z'": 10}
+CICP_TRANSFER = {'Linear': 8, '2.2 Power - sRGB Display': 4, '2.4 Power - Rec.1886': 1,
+                 '2.6 Power DCI': 17, 'PQ': 16, 'HLG': 18}
+
+
+def fmt(v):
+    if isinstance(v, bool):
+        return 'true' if v else 'false'
+    if isinstance(v, float):
+        return repr(v)
+    return str(v)
+
+
+def is_opendrt(node):
+    return all(k in node.knobs() for k in ('look_preset_knobs', 'tn_Lp', 'eotf', 'display_gamut', 'in_gamut'))
+
+
+def to_nits(v, eotf, lp):
+    """Decode one display code value to cd/m2 for OpenDRT's output encodings (neutral)."""
+    v = max(v, 0.0)
+    if eotf == 'Linear':
+        return v * lp
+    if eotf == 'PQ':
+        m1, m2, c1, c2, c3 = 2610 / 16384., 2523 / 32., 107 / 128., 2413 / 128., 2392 / 128.
+        e = v ** (1 / m2)
+        return 10000.0 * (max(e - c1, 0.0) / (c2 - c3 * e)) ** (1 / m1)
+    if eotf == 'HLG':
+        a, b, c = 0.17883277, 1 - 4 * 0.17883277, 0.5 - 0.17883277 * math.log(4 * 0.17883277)
+        e = v * v / 3.0 if v <= 0.5 else (math.exp((v - c) / a) + b) / 12.0
+        return 1000.0 * e ** 1.2
+    return lp * v ** {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
+
+
+def describe_opendrt(nb, node, log_input, measured):
+    """Append <Model>, <Mastering> and <Interop> for an OpenDRT node."""
+    import re
+    about = node['about_label'].value() if 'about_label' in node.knobs() else ''
+    ver = re.search(r'v(\d+\.\d+\.\d+)', about)
+    model = ET.SubElement(nb, 'Model', name='OpenDRT', node=node.name())
+    if ver:
+        model.set('version', ver.group(1))
+    if 'look_name' in node.knobs():
+        model.set('look', node['look_name'].value())
+    for elem, ids in OPENDRT_MODEL:
+        e = ET.SubElement(model, elem)
+        for pid in ids:
+            if pid not in node.knobs():
+                continue
+            k = node[pid]
+            e.set(pid, fmt(k.value()))
+            if k.Class() == 'Enumeration_Knob':
+                e.set(pid + '_index', str(int(k.getValue())))
+    eotf, gamut = node['eotf'].value(), node['display_gamut'].value()
+    lp, lg, gb = node['tn_Lp'].value(), node['tn_Lg'].value(), node['tn_gb'].value()
+    mast = ET.SubElement(nb, 'Mastering')
+    dcv = ET.SubElement(mast, 'DisplayColorVolume', gamut=gamut, maxLuminance=fmt(float(lp)), minLuminance='0.0')
+    if gamut in XY:
+        r, g, b, w = XY[gamut]
+        for name, xy in (('red', r), ('green', g), ('blue', b), ('white', w)):
+            dcv.set(name, '%g %g' % xy)
+    if gamut == 'Rec.2020 (P3 Limited)':
+        dcv.set('limitedTo', 'P3-D65')
+    # greyNominal: tn_Lg with grey boost, i.e. the tonescale constraint before
+    # surround compensation (dim/bright lift it); greyMeasured is the truth.
+    lum = ET.SubElement(mast, 'Luminance', peak=fmt(float(lp)),
+                        greyNominal='%.6g' % (lg * (1.0 + gb * math.log(lp / 100.0, 2))))
+    if measured:
+        grey, white = measured
+        lum.set('greyMeasured', '%.4g' % to_nits(sum(grey) / 3.0, eotf, lp))
+        lum.set('diffuseWhiteMeasured', '%.4g' % to_nits(sum(white) / 3.0, eotf, lp))
+        lum.set('measuredFrom', 'chain output for neutral 0.18 and 1.0, decoded with the output EOTF')
+    su = node['tn_su'].value()
+    ET.SubElement(mast, 'ViewingEnvironment', surround=su,
+                  ambient={'dark': 'theatre, dark surround', 'dim': 'video, 5 nit surround',
+                           'bright': 'office or living room surround'}.get(su, ''))
+    ET.SubElement(mast, 'CreativeWhite', whitepoint=node['cwp'].value(), limit=fmt(node['cwp_lm'].value()))
+    if gamut in CICP_PRIMARIES and eotf in CICP_TRANSFER:
+        ET.SubElement(mast, 'CICP', primaries=str(CICP_PRIMARIES[gamut]), transfer=str(CICP_TRANSFER[eotf]),
+                      matrix='0', fullRange='true', note='ITU-T H.273; transfer 1 signals BT.709/BT.1886 by convention')
+    interop = {}
+    if not log_input and node['in_gamut'].value() in INTEROP_IN:
+        interop['input'] = INTEROP_IN[node['in_gamut'].value()]
+    if (eotf, gamut) in INTEROP_OUT:
+        interop['output'] = INTEROP_OUT[(eotf, gamut)]
+    if interop:
+        ET.SubElement(nb, 'Interop', interop)
+
+
+def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True):
+    """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k).
+    measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None."""
     n, rows = read_cube(cube)
     ctf = os.path.splitext(path)[1].lower() == '.ctf'
     tail = nodes[-1]
@@ -159,7 +295,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input):
     ET.SubElement(root, 'InputDescriptor').text = (
         shaper['preset'] if log_input else 'Linear (%s shaper)' % shaper['preset'])
     ET.SubElement(root, 'OutputDescriptor').text = tail.name()
-    nb = ET.SubElement(ET.SubElement(root, 'Info'), 'NukeBake', version='1')
+    nb = ET.SubElement(ET.SubElement(root, 'Info'), 'NukeBake', version='2')
     sh = ET.SubElement(nb, 'Shaper')
     for k in ('preset', 'shortname', 'cube_size', 'gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'):
         if k in shaper:
@@ -170,7 +306,11 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input):
         e = ET.SubElement(ns, 'Node', {'class': node.Class(), 'name': node.name()})
         for name, val in knob_values(node):
             ET.SubElement(e, 'Knob', name=name).text = val
-    ET.SubElement(nb, 'Script').text = chain_script(nodes)
+    for node in nodes:
+        if is_opendrt(node):
+            describe_opendrt(nb, node, log_input, measured)
+    if embed_script:
+        ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
                   date=datetime.datetime.now().isoformat(timespec='seconds'),
                   script=nuke.root().name())
@@ -267,7 +407,7 @@ if mode != 'preset':
         xs = [(i + 0.5) * W / NX for i in range(NX)]
 
         def row(v):
-            y = (v + 0.5) * H / 7
+            y = (v + 0.5) * H / 8
             return [[gen.sample(c, x, y) for c in ('red', 'green', 'blue')] for x in xs]
 
         def run_start(vals):
@@ -349,12 +489,20 @@ if not path:
     path = default_path(nodes[-1], shaper['shortname'])
     gen['file'].setValue(path)
 
+# chain output for neutral 0.18 and 1.0 (probe row 7: left half grey, right half white)
+shaper_node['probe'].setValue(True)
+try:
+    W, H = gen.width(), gen.height()
+    measured = tuple([gen.sample(c, x, 7.5 * H / 8) for c in ('red', 'green', 'blue')] for x in (W * 0.25, W * 0.75))
+finally:
+    shaper_node['probe'].setValue(False)
 shaper_node['pattern'].setValue(True)
 try:
     tmp = bake_cube(gen.node('GenerateLUT1'))
 finally:
     shaper_node['pattern'].setValue(False)
-size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input)
+size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
+                 measured, bool(gen['embed_script'].value()))
 os.remove(tmp)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
     os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'], fit_note))
@@ -437,15 +585,19 @@ src = n.input(0)
 with nuke.thisParent():
     pat = nuke.nodes.CMSTestPattern(cube_size=SHAPER['cube_size'])
     inv = nuke.nodes.Expression(inputs=[pat], expr0=EXPR[0], expr1=EXPR[1], expr2=EXPR[2])
+    gw = nuke.nodes.Expression(expr0='x<width/2?0.18:1', expr1='x<width/2?0.18:1', expr2='x<width/2?0.18:1')
     lut = nuke.nodes.GenerateLUT(inputs=[n])
-n.setInput(0, inv)
 try:
+    n.setInput(0, gw)
+    W, H = n.width(), n.height()
+    measured = tuple([n.sample(c, x, H * 0.5) for c in ('red', 'green', 'blue')] for x in (W * 0.25, W * 0.75))
+    n.setInput(0, inv)
     tmp = bake_cube(lut)
 finally:
     n.setInput(0, src)
-    for t in (lut, inv, pat):
+    for t in (lut, gw, inv, pat):
         nuke.delete(t)
-write_clf(path, tmp, SHAPER, [n], 'tetrahedral', False)
+write_clf(path, tmp, SHAPER, [n], 'tetrahedral', False, measured, True)
 os.remove(tmp)
 nuke.message('wrote %s' % path)
 '''.replace('__SHAPER__', repr(OPENDRT_SHAPER)).replace(
@@ -482,18 +634,20 @@ def build_shaper():
     par = dict((k, 'parent.' + k) for k in ('logbreak', 'linoff', 'sl', 'go', 'gs', 'lo', 'ls'))
     for i, c in enumerate('rgb'):
         inv['expr%d' % i].setValue(inverse_expr(c, par))
-    # probe ramps for "fit shaper to chain": 7 rows x 1024 columns.
-    # t: exposure ramp -20..+24 stops around 0.18; n: negative magnitude ramp.
-    nuke.addFormat('1024 7 0 0 1024 7 1 clfbake_probe')
+    # probe ramps: 8 rows x 1024 columns. Rows 0-3 exposure ramps (-20..+24
+    # stops around 0.18; neutral, then chromatic), rows 4-6 single-channel
+    # negative ramps, row 7 neutral 0.18 (left) and 1.0 (right) for luminance.
+    nuke.addFormat('1024 8 0 0 1024 8 1 clfbake_probe')
     con = nuke.nodes.Constant(name='ProbeFormat')
     con['format'].setValue('clfbake_probe')
     ramp = nuke.nodes.Expression(name='ProbeRamp', inputs=[con])
     ramp['temp_name0'].setValue('t'); ramp['temp_expr0'].setValue('0.18*pow(2,-20+44*x/width)')
     ramp['temp_name1'].setValue('n'); ramp['temp_expr1'].setValue('0.18*pow(2,-20+26*x/width)')
-    ramp['temp_name2'].setValue('v'); ramp['temp_expr2'].setValue('floor(y/height*7)')
-    ramp['expr0'].setValue('v==0?t:v==1?t:v==2?0.2*t:v==3?0.2*t:v==4?-n:0.18')
-    ramp['expr1'].setValue('v==0?t:v==1?0.2*t:v==2?t:v==3?0.2*t:v==5?-n:0.18')
-    ramp['expr2'].setValue('v==0?t:v==1?0.2*t:v==2?0.2*t:v==3?t:v==6?-n:0.18')
+    ramp['temp_name2'].setValue('v'); ramp['temp_expr2'].setValue('floor(y/height*8)')
+    gw = 'v==7?(x<width/2?0.18:1):0.18'
+    ramp['expr0'].setValue('v==0?t:v==1?t:v==2?0.2*t:v==3?0.2*t:v==4?-n:' + gw)
+    ramp['expr1'].setValue('v==0?t:v==1?0.2*t:v==2?t:v==3?0.2*t:v==5?-n:' + gw)
+    ramp['expr2'].setValue('v==0?t:v==1?0.2*t:v==2?0.2*t:v==3?t:v==6?-n:' + gw)
     sw = nuke.nodes.Switch(name='Switch1', inputs=[inp, inv, ramp])
     sw['which'].setExpression('parent.pattern?1:(parent.probe?2:0)')
     nuke.nodes.Output(name='Output1', inputs=[sw])
@@ -595,6 +749,11 @@ def build_generate():
     k.setTooltip('Omit the shaper from the CLF so it takes the shaper log encoding as input, '
                  'the way the released OpenDRT OCIO config consumes its cubes. '
                  'Default off: the shaper is embedded and the CLF takes linear input.')
+    g.addKnob(k)
+    k = nuke.Boolean_Knob('embed_script', 'embed node script')
+    k.setValue(True)
+    k.setTooltip('Also store the baked nodes as a Nuke script inside the CLF so From CLF can rebuild them '
+                 'exactly. The structured parameters, mastering and interop metadata are written regardless.')
     g.addKnob(k)
     k = nuke.Enumeration_Knob('domain', 'domain', ['preset', 'auto', 'fit'])
     k.setTooltip('preset: use the shaper as set on CLFShaper.\n'
