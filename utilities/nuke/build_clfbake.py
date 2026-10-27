@@ -236,9 +236,11 @@ if not nodes:
     raise RuntimeError('Nothing between %s and %s to bake' % (n.name(), gen.name()))
 shaper_node = n
 fit_note = ''
-if bool(gen['fit'].value()):
+mode = gen['domain'].value()
+if mode != 'preset':
     # Probe the chain: seven ramps (neutral, 3 chromatic, 3 single-channel
-    # negative), find where the output stops changing, fit XLog to that.
+    # negative), find where the output stops changing by more than a 10-bit
+    # step, then fit XLog to that (fit) or only if the preset falls short (auto).
     sn = shaper_node
     sn['probe'].setValue(True)
     try:
@@ -250,7 +252,7 @@ if bool(gen['fit'].value()):
             return [[gen.sample(c, x, y) for c in ('red', 'green', 'blue')] for x in xs]
 
         def run_start(vals):
-            eps = 2e-4 * max(1.0, max(abs(c) for p in vals for c in p))
+            eps = max(1.0, max(abs(c) for p in vals for c in p)) / 1023.0
             last, i = vals[-1], len(vals) - 1
             while i > 0 and max(abs(a - b) for a, b in zip(vals[i - 1], last)) <= eps:
                 i -= 1
@@ -269,8 +271,25 @@ if bool(gen['fit'].value()):
             floor = min(floor, -0.18 * 2 ** (-20 + 26 * (i + 0.5) / NX))
     finally:
         sn['probe'].setValue(False)
-    w0 = 2.0 ** 16 if 'top' in unsat else min(2.0 ** 16, max(1.0, 2.0 * top))
-    floor = -1.0 if 'floor' in unsat else 2.0 * floor
+    if 'top' in unsat:
+        top = 2.0 ** 15
+    if 'floor' in unsat:
+        floor = -0.5
+    # what the current preset already covers (lin at code 1 and code 0)
+    gs, go, ls, lo, lb, sl = [sn[k].value() for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl')]
+    logbreak = gs * math.log(ls * lb + lo, 2) + go
+    have_top = (2.0 ** ((1.0 - go) / gs) - lo) / ls
+    have_floor = (0.0 - (logbreak - sl * lb)) / sl if 0.0 <= logbreak else (2.0 ** ((0.0 - go) / gs) - lo) / ls
+    # an unbounded floor (DRTs keep desaturating negatives forever) is not a
+    # reason to fit: the shadow guard caps what a fit could give anyway
+    need = top > have_top or ('floor' not in unsat and floor < have_floor)
+    mode = 'fit' if mode == 'fit' or need else 'keep'
+    if mode == 'keep':
+        fit_note = ', auto: %s covers it (top %.4g <= %.4g, floor %.3g >= %.3g)' % (
+            sn['preset'].value(), top, have_top, floor, have_floor)
+if mode == 'fit':
+    w0 = min(2.0 ** 16, max(1.0, 2.0 * top))
+    floor = 2.0 * floor
     # XLog: w0 sets the top; solve k for the floor (lin value at code 0),
     # keeping the linear toe's join at least 5 stops under grey.
     o, x0, y0 = sn['o'].value(), sn['x0'].value(), sn['y0'].value()
@@ -299,7 +318,7 @@ if bool(gen['fit'].value()):
     sn['w0'].setValue(w0)
     sn['k'].setValue(k)
     fit_note = ', fit: top %.4g -> w0 %.4g, floor %.3g -> %.3g (k %.3g)%s' % (
-        top, w0, floor, floor_of(k), k, ' [unsaturated: %s]' % ' '.join(sorted(set(unsat))) if unsat else '')
+        top, w0, floor / 2.0, floor_of(k), k, ' [unsaturated: %s]' % ' '.join(sorted(set(unsat))) if unsat else '')
 shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'))
 shaper['preset'] = shaper_node['preset'].value()
 shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
@@ -517,11 +536,13 @@ def build_generate():
                  'the way the released OpenDRT OCIO config consumes its cubes. '
                  'Default off: the shaper is embedded and the CLF takes linear input.')
     g.addKnob(k)
-    k = nuke.Boolean_Knob('fit', 'fit shaper to chain')
-    k.setTooltip('Before baking, probe the chain with exposure ramps to find where its output stops '
-                 'changing, then set the shaper to XLog with w0 at the top (one stop of margin) and the '
-                 'linear toe reaching the negative floor. The fitted XLog is written to the CLF exactly, '
-                 'like any preset. Off: the preset is used as is.')
+    k = nuke.Enumeration_Knob('domain', 'domain', ['preset', 'auto', 'fit'])
+    k.setTooltip('preset: use the shaper as set on CLFShaper.\n'
+                 'auto: probe the chain with exposure ramps; if its output still changes by more than a '
+                 '10-bit step beyond the preset\'s top or floor, replace the preset with a fitted XLog.\n'
+                 'fit: always fit. XLog gets w0 one stop above where the output stops changing and a '
+                 'linear toe reaching the negative floor. A fitted XLog is written to the CLF exactly, '
+                 'like any preset, and the status line reports what was found.')
     g.addKnob(k)
     k = nuke.PyScript_Knob('generate', 'Generate', script(
         GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS])).replace('__XLOG__', str(XLOG))))

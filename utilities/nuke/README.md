@@ -24,14 +24,17 @@ image -> CLFShaper -> [ OpenDRT, looks, anything ] -> CLFGenerate -> viewer
   is selected).
 
 Shapers are static: T-LogE covers −0.0046 to 512 linear for every input, which
-is Jed's trade-off in the released config. Tick **fit shaper to chain** on
-CLFGenerate to size the domain from the chain instead. Generate then probes it
-with exposure ramps (neutral, chromatic, and single-channel negatives), finds
-where the output stops changing, and sets the shaper to XLog with w0 one stop
-above the top and k reaching the negative floor, keeping the linear toe at
-least five stops under grey so shadow resolution is not traded away. The
-status line reports what it found. The fitted XLog is still written to the CLF
-as an exact parametric Log node.
+is Jed's trade-off in the released config, and the default **domain** setting
+on CLFGenerate, `preset`, uses it as is. `auto` probes the chain with exposure
+ramps (neutral, chromatic, and single-channel negatives) and, only if the
+output still changes by more than a 10-bit step beyond the preset's top or
+floor, replaces the preset with a fitted XLog: w0 one stop above where the
+output stops changing and k reaching the negative floor, with the linear toe
+kept at least five stops under grey so shadow resolution is not traded away.
+`fit` always does that. The status line reports what was found, and a fitted
+XLog is still written to the CLF as an exact parametric Log node. Measured on
+OpenDRT, the fit halves the worst-case error for inputs beyond T-LogE's range
+at the cost of a little in-domain accuracy at 48³; 65³ recovers it.
 
 The nodes need nothing beyond Nuke's own Python: the CLF is written with
 `xml.etree`, so no PyOpenColorIO import happens at bake time.

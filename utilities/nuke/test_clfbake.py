@@ -203,13 +203,24 @@ if bad:
     failures.append('opendrt button restore')
 assert 'clf_file' not in open(clf2).read(), 'clf_file must not be recorded'
 
-# --- 7. fit shaper to chain ---------------------------------------------------
+# --- 7. domain: auto keeps a sufficient preset, fit replaces it ---------------
+shaper['preset'].setValue(len(shaper['preset'].values()) - 1)   # XLog
+shaper['w0'].setValue(60000.0)
+gen['file'].setValue(os.path.join(OUT, 'test_auto.clf'))
+gen['domain'].setValue('auto')
+gen['generate'].execute()
+print('status:', gen['status'].value())
+ok = 'auto: XLog covers it' in gen['status'].value() and shaper['w0'].value() == 60000.0
+print('%s auto keeps a sufficient preset' % ('PASS' if ok else 'FAIL'))
+if not ok:
+    failures.append('auto keep')
 shaper['preset'].setValue(PRESET)
+shaper['w0'].setValue(128.0)
 clf_fit = os.path.join(OUT, 'test_fit.clf')
 gen['file'].setValue(clf_fit)
-gen['fit'].setValue(True)
+gen['domain'].setValue('fit')
 gen['generate'].execute()
-gen['fit'].setValue(False)
+gen['domain'].setValue('preset')
 print('status:', gen['status'].value())
 assert shaper['preset'].value() == 'XLog', shaper['preset'].value()
 hi_f, lo_f = log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0)
