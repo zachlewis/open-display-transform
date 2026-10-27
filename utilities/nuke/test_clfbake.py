@@ -10,8 +10,10 @@ then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
      error,
   3. a log-input CLF applied to log-encoded values matches too,
   4. Restore applies the recorded OpenDRT parameters to a fresh node,
-  5. the same bake written as CTF loads.
-Exits non-zero on failure.
+  5. the same bake written as CTF loads,
+  6. the thin Bake CLF / Restore CLF buttons on OpenDRT itself do the same.
+PyOpenColorIO is used here only as the independent reader; the nodes write
+the CLF with xml.etree. Exits non-zero on failure.
 """
 import math
 import os
@@ -97,11 +99,16 @@ shaper['cube_size'].setValue(48)
 
 # test image spanning the shaper's own domain: 24 stops below its top, and
 # negatives down to half of what the linear toe admits
+def test_image(hi, lo, name):
+    img = nuke.nodes.Expression(name=name)
+    img['expr0'].setValue('%r*pow(2,24*(x/width-1))' % hi)
+    img['expr1'].setValue('%r*pow(2,24*(y/height-1))' % hi)
+    img['expr2'].setValue('0.5*(r+g)*(0.5+0.5*sin(x*0.7+y*0.3))+%r' % (0.5 * lo))
+    return img
+
+
 hi, lo = log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0)
-img = nuke.nodes.Expression(name='TestImage')
-img['expr0'].setValue('%r*pow(2,24*(x/width-1))' % hi)
-img['expr1'].setValue('%r*pow(2,24*(y/height-1))' % hi)
-img['expr2'].setValue('0.5*(r+g)*(0.5+0.5*sin(x*0.7+y*0.3))+%r' % (0.5 * lo))
+img = test_image(hi, lo, 'TestImage')
 shaper.setInput(0, img)
 drt.setInput(0, shaper)
 gen.setInput(0, drt)
@@ -168,6 +175,31 @@ ctf = os.path.join(OUT, 'test.ctf')
 gen['file'].setValue(ctf)
 gen['generate'].execute()
 check('ctf: CLF vs CTF', max_err(apply_clf(ctf, lin), apply_clf(clf, lin)), 1e-6)
+
+# --- 6. thin buttons on OpenDRT itself (fixed T-LogE shaper) -------------------
+preset_was = int(shaper['preset'].getValue())
+shaper['preset'].setValue(0)
+img2 = test_image(log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0), 'TestImageTLogE')
+shaper['preset'].setValue(preset_was)
+d2 = paste(OPENDRT)[0]
+d2.setInput(0, img2)
+for k in ('tn_con', 'hs_r', 'brl_enable', 'tn_Lp', 'display_name'):
+    d2[k].fromScript(drt[k].toScript())
+clf2 = os.path.join(OUT, 'opendrt_button.clf')
+d2['clf_file'].setValue(clf2)
+d2['bake_clf'].execute()
+assert os.path.exists(clf2), clf2
+assert d2.input(0) is img2, 'Bake CLF did not restore the input'
+assert '<Log ' in open(clf2).read()
+check('opendrt button: CLF vs Nuke', max_err(apply_clf(clf2, sample(img2, W, H)), sample(d2, W, H)), IMAGE_TOL)
+d3 = paste(OPENDRT)[0]
+d3['clf_file'].setValue(clf2)
+d3['restore_clf'].execute()
+bad = [k for k in knobs if d2[k].toScript() != d3[k].toScript()]
+print('%s opendrt button restore: %d knobs compared, %d differ %s' % ('PASS' if not bad else 'FAIL', len(knobs), len(bad), bad))
+if bad:
+    failures.append('opendrt button restore')
+assert 'clf_file' not in open(clf2).read(), 'clf_file must not be recorded'
 
 print('outputs in', OUT)
 if failures:

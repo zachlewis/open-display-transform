@@ -23,6 +23,16 @@ image -> CLFShaper -> [ OpenDRT, looks, anything ] -> CLFGenerate -> viewer
   to the selected nodes of the same class (or to the upstream chain when nothing
   is selected).
 
+The nodes need nothing beyond Nuke's own Python: the CLF is written with
+`xml.etree`, so no PyOpenColorIO import happens at bake time.
+
+**OpenDRT.nk** also carries a thin "CLF Helpers" group next to Jed's DCTL
+Helpers: a file knob, **Bake CLF** and **Restore CLF**. Bake CLF wraps the node
+in the T-LogE shaper at 48³ with tetrahedral interpolation, exactly the recipe
+of the released OpenDRT OCIO config, and writes the same metadata, so a CLF
+baked there can be restored by CLFGenerate and vice versa. Use the standalone
+pair when you want another shaper, size, or to bake a chain of nodes.
+
 Shaper presets are the OCIO `LogCameraTransform` parameters from
 [ociogen](https://github.com/jedypod/ociogen): T-LogE (default, what the
 OpenDRT OCIO config uses), T-Log, ACEScct, Arri LogC3, Arri LogC4, Sony S-Log3,
@@ -57,9 +67,11 @@ Use the CLF from any OCIO config, for example as a display colorspace:
 
 ## Development
 
-`CLFBake.nk` is generated: edit `build_clfbake.py` and rebuild, then run the
-headless verification, which bakes the OpenDRT node and compares the CLF
-applied with PyOpenColorIO against Nuke's own render:
+`CLFBake.nk` and the CLF Helpers group in `OpenDRT.nk` are both generated from
+`build_clfbake.py`, which holds the shared Python once: edit it and rebuild,
+then run the headless verification, which bakes the OpenDRT node both ways and
+compares the CLF applied with PyOpenColorIO (the independent reader) against
+Nuke's own render:
 
 ```
 rez-env nuke fxphd -- nuke -t build_clfbake.py

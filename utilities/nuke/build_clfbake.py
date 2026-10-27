@@ -1,10 +1,12 @@
-"""Build CLFBake.nk: the CLFShaper and CLFGenerate nodes.
+"""Build CLFBake.nk (CLFShaper + CLFGenerate) and the thin "CLF Helpers"
+buttons in OpenDRT.nk. Run inside Nuke so knob scripts are escaped by Nuke:
 
-Run inside Nuke so the knob scripts are escaped by Nuke itself:
+    rez-env nuke fxphd -- nuke -t build_clfbake.py
 
-    rez-env nuke fxphd -- nuke -t build_clfbake.py [out.nk]
-
-The resulting .nk is self-contained: paste it into any Nuke 15.1+ script.
+Writes utilities/nuke/CLFBake.nk and splices the CLF Helpers knob group into
+display-transforms/opendrt/OpenDRT.nk (replacing it if already present).
+The nodes need nothing beyond Nuke's Python: the CLF is written with
+xml.etree, not PyOpenColorIO.
 """
 import math
 import os
@@ -12,8 +14,11 @@ import sys
 
 import nuke
 
+HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+OPENDRT = os.path.join(HERE, '..', '..', 'display-transforms', 'opendrt', 'OpenDRT.nk')
+
 # ---------------------------------------------------------------------------
-# Shaper presets. OCIO LogCameraTransform parameters, base 2, as used by Jed's
+# Shaper presets: OCIO LogCameraTransform parameters, base 2, as used by Jed's
 # ociogen (https://github.com/jedypod/ociogen) and therefore by the released
 # OpenDRT OCIO config, whose LUTs are shaped through T-LogE.
 #   (label, shortname, logSideSlope, logSideOffset, linSideSlope,
@@ -31,35 +36,46 @@ PRESETS = [
     ("XLog", "xlog", None, None, None, None, None, None),
 ]
 XLOG = len(PRESETS) - 1
+XLOG_DEFAULTS = (('w0', 128.0), ('o', 7.5), ('x0', 0.0), ('y0', 0.075), ('k', 0.06))
+
+
+def auto_slope(p):
+    """linearSlope OCIO computes when unset: derivative of the log segment at the break."""
+    return p[2] * p[4] / ((p[4] * p[6] + p[5]) * math.log(2.0))
+
+
+def preset_params(i):
+    p = PRESETS[i]
+    return dict(gs=p[2], go=p[3], ls=p[4], lo=p[5], lb=p[6], sl=p[7] if p[7] is not None else auto_slope(p))
 
 
 def table_expr(col, xlog_expr):
-    """Nested ternary over the preset index for one LogCamera parameter."""
+    """Nuke expression: nested ternary over the preset index for one parameter."""
     expr = xlog_expr
     for i in range(XLOG - 1, -1, -1):
-        p = PRESETS[i]
-        v = p[col]
-        if col == 7 and v is None:  # auto linear slope: derivative at the break
-            v = p[2] * p[4] / ((p[4] * p[6] + p[5]) * math.log(2.0))
+        v = PRESETS[i][col]
+        if col == 7 and v is None:
+            v = auto_slope(PRESETS[i])
         expr = "preset==%d?%.17g:(%s)" % (i, v, expr)
     return expr
 
 
-SHAPER_KNOBCHANGED = r"""n = nuke.thisNode()
-if nuke.thisKnob().name() in ('preset', 'showPanel'):
-    x = n['preset'].getValue() == %d
-    for k in ('w0', 'o', 'x0', 'y0', 'k'):
-        n[k].setVisible(x)
-""" % XLOG
+# inverse shaper (log code value -> linear), the same formula for all presets
+INVERSE = '%(c)s<=%(logbreak)s?(%(c)s-%(linoff)s)/%(sl)s:(pow(2,(%(c)s-%(go)s)/%(gs)s)-%(lo)s)/%(ls)s'
 
 
-GENERATE = r'''import os, datetime, tempfile
+def inverse_expr(c, par):
+    return INVERSE % dict(par, c=c)
+
+
+# ---------------------------------------------------------------------------
+# Python shared by every button. Pure stdlib + nuke.
+# ---------------------------------------------------------------------------
+COMMON = r'''import os, datetime, tempfile
+import xml.etree.ElementTree as ET
 import nuke
-import PyOpenColorIO as ocio
 
-gen = nuke.thisNode()
 MARK = 'clfbake_shaper'
-SHORT = __SHORT__
 SKIP_CLASSES = ('Tab_Knob', 'Text_Knob', 'PyScript_Knob', 'Script_Knob',
                 'Obsolete_Knob', 'Pulldown_Knob', 'Help_Knob',
                 'BeginTabGroup_Knob', 'EndTabGroup_Knob')
@@ -71,17 +87,7 @@ SKIP_NAMES = ('name', 'xpos', 'ypos', 'selected', 'tile_color', 'note_font',
               'lifetimeEnd', 'useLifetime', 'lock_connections', 'help',
               'mapsize', 'window', 'rootNodeUpdated', 'process_mask',
               'disable', 'label', 'group_view_position', 'show_group_view',
-              'disable_group_view')
-
-
-def chain():
-    nodes, n = [], gen.input(0)
-    while n is not None:
-        if MARK in n.knobs():
-            return n, nodes
-        nodes.append(n)
-        n = n.input(0)
-    raise RuntimeError('No CLFShaper found upstream of %s' % gen.name())
+              'disable_group_view', 'clf_file')
 
 
 def knob_values(n):
@@ -102,165 +108,224 @@ def knob_values(n):
     return out
 
 
-def child(md, name, value=''):
-    md.addChildElement(name, value)
-    return list(md.getChildElements())[-1]
+def default_path(node, short, ext='.clf'):
+    root = nuke.root().name()
+    d = os.path.dirname(root) if root and root != 'Root' else tempfile.gettempdir()
+    return os.path.join(d, '%s__%s%s' % (node.name(), short, ext)).replace(os.sep, '/')
 
 
-shaper, nodes = chain()
+def read_cube(path):
+    n, rows = None, []
+    for line in open(path):
+        t = line.split()
+        if not t or t[0].startswith('#'):
+            continue
+        if t[0] == 'LUT_3D_SIZE':
+            n = int(t[1])
+        elif len(t) == 3 and t[0][0] in '-+.0123456789':
+            rows.append(' '.join(t))
+    if n is None or len(rows) != n ** 3:
+        raise RuntimeError('unexpected cube %s: size %s, %d rows' % (path, n, len(rows)))
+    # .cube is red-fastest, CLF Array is blue-fastest
+    return n, [rows[r + n * g + n * n * b] for r in range(n) for g in range(n) for b in range(n)]
+
+
+def write_clf(path, cube, shaper, nodes, interpolation, log_input):
+    """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k)."""
+    n, rows = read_cube(cube)
+    ctf = os.path.splitext(path)[1].lower() == '.ctf'
+    tail = nodes[-1]
+    root = ET.Element('ProcessList', {'version': '2'} if ctf else {'compCLFversion': '3'})
+    root.set('id', '%s__%s' % (tail.name(), shaper['shortname']))
+    root.set('name', tail.name())
+    ET.SubElement(root, 'InputDescriptor').text = (
+        shaper['preset'] if log_input else 'Linear (%s shaper)' % shaper['preset'])
+    ET.SubElement(root, 'OutputDescriptor').text = tail.name()
+    nb = ET.SubElement(ET.SubElement(root, 'Info'), 'NukeBake', version='1')
+    sh = ET.SubElement(nb, 'Shaper')
+    for k in ('preset', 'shortname', 'cube_size', 'gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'):
+        if k in shaper:
+            sh.set(k, str(shaper[k]))
+    sh.set('embedded', 'false' if log_input else 'true')
+    ns = ET.SubElement(nb, 'Nodes')
+    for node in nodes:
+        e = ET.SubElement(ns, 'Node', {'class': node.Class(), 'name': node.name()})
+        for name, val in knob_values(node):
+            ET.SubElement(e, 'Knob', name=name).text = val
+    ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
+                  date=datetime.datetime.now().isoformat(timespec='seconds'),
+                  script=nuke.root().name())
+    if not log_input:
+        log = ET.SubElement(root, 'Log', inBitDepth='32f', outBitDepth='32f', style='cameraLinToLog')
+        ET.SubElement(log, 'LogParams', base='2',
+                      linSideSlope=repr(float(shaper['ls'])), linSideOffset=repr(float(shaper['lo'])),
+                      logSideSlope=repr(float(shaper['gs'])), logSideOffset=repr(float(shaper['go'])),
+                      linSideBreak=repr(float(shaper['lb'])), linearSlope=repr(float(shaper['sl'])))
+    lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
+    arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
+    if hasattr(ET, 'indent'):
+        ET.indent(root, '    ')
+    arr.text = '\n' + '\n'.join('            ' + r for r in rows) + '\n        '
+    ET.ElementTree(root).write(path, encoding='UTF-8', xml_declaration=True)
+    return n
+
+
+def bake_cube(generate_lut):
+    tmp = os.path.join(tempfile.gettempdir(), 'clfbake_%d.cube' % os.getpid()).replace(os.sep, '/')
+    generate_lut['file'].setValue(tmp)
+    generate_lut['file_type'].setValue('.cube')
+    f = nuke.frame()
+    nuke.execute(generate_lut, f, f)
+    return tmp
+
+
+def read_bake(path):
+    root = ET.parse(path).getroot()
+    for e in root.iter():
+        if e.tag.split('}')[-1] == 'NukeBake':
+            return e
+    raise RuntimeError('%s has no NukeBake metadata' % path)
+
+
+def restore_apply(nb, targets):
+    """Apply recorded values to targets (nodes). Returns (done, shaper element)."""
+    targets, done = list(targets), []
+    sh = nb.find('Shaper')
+    for t in targets:
+        if sh is not None and MARK in t.knobs():
+            t['preset'].setValue(sh.get('preset'))
+            for k in ('w0', 'o', 'x0', 'y0', 'k'):
+                if sh.get(k) is not None:
+                    t[k].setValue(float(sh.get(k)))
+            t['cube_size'].setValue(int(sh.get('cube_size', 48)))
+            done.append(t.name())
+            targets.remove(t)
+            break
+    for e in nb.find('Nodes') if nb.find('Nodes') is not None else []:
+        match = None
+        for t in targets:
+            if t.Class() == e.get('class'):
+                match = t
+                break
+        if match is None:
+            continue
+        targets.remove(match)
+        for k in e:
+            name = k.get('name')
+            if name in match.knobs():
+                try:
+                    match[name].fromScript(k.text or '')
+                except Exception:
+                    pass
+        done.append('%s <- %s' % (match.name(), e.get('name')))
+    return done, sh
+'''
+
+
+GENERATE = COMMON + r'''
+SHORT = __SHORT__
+gen = nuke.thisNode()
+
+nodes, n = [], gen.input(0)
+while n is not None and MARK not in n.knobs():
+    nodes.append(n)
+    n = n.input(0)
+if n is None:
+    raise RuntimeError('No CLFShaper found upstream of %s' % gen.name())
 if not nodes:
-    raise RuntimeError('Nothing between %s and %s to bake' % (shaper.name(), gen.name()))
-preset = shaper['preset'].value()
-short = SHORT[int(shaper['preset'].getValue())]
-par = dict((k, shaper[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl'))
-size = int(shaper['cube_size'].value())
+    raise RuntimeError('Nothing between %s and %s to bake' % (n.name(), gen.name()))
+shaper_node = n
+shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'))
+shaper['preset'] = shaper_node['preset'].value()
+shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
+shaper['cube_size'] = int(shaper_node['cube_size'].value())
 log_input = bool(gen['log_input'].value())
 
 path = gen['file'].evaluate()
 if not path:
-    root = nuke.root().name()
-    d = os.path.dirname(root) if root and root != 'Root' else tempfile.gettempdir()
-    path = os.path.join(d, '%s__%s.clf' % (nodes[-1].name(), short))
-    gen['file'].setValue(path.replace(os.sep, '/'))
-ext = os.path.splitext(path)[1].lower()
-fmt = 'Color Transform Format' if ext == '.ctf' else 'Academy/ASC Common LUT Format'
+    path = default_path(nodes[-1], shaper['shortname'])
+    gen['file'].setValue(path)
 
-# 1. bake the shaped test pattern through the chain with Nuke's GenerateLUT
-tmp = os.path.join(tempfile.gettempdir(), 'clfbake_%s_%d.cube' % (gen.name(), os.getpid()))
-gen['tmp_cube'].setValue(tmp.replace(os.sep, '/'))
-shaper['pattern'].setValue(True)
+shaper_node['pattern'].setValue(True)
 try:
-    f = nuke.frame()
-    nuke.execute(gen.node('GenerateLUT1'), f, f)
+    tmp = bake_cube(gen.node('GenerateLUT1'))
 finally:
-    shaper['pattern'].setValue(False)
-
-# 2. wrap it in a CLF: parametric shaper + LUT3D + metadata
-cfg = ocio.Config.CreateRaw()
-proc = cfg.getProcessor(ocio.FileTransform(src=tmp))
-lut = None
-for t in proc.getOptimizedProcessor(ocio.OPTIMIZATION_NONE).createGroupTransform():
-    if isinstance(t, ocio.Lut3DTransform):
-        lut = t
-if lut is None:
-    raise RuntimeError('GenerateLUT did not produce a 3D LUT: %s' % tmp)
-lut.setInterpolation(ocio.INTERP_TETRAHEDRAL if gen['interpolation'].value() == 'tetrahedral'
-                     else ocio.INTERP_LINEAR)
-grp = ocio.GroupTransform()
-if not log_input:
-    grp.appendTransform(ocio.LogCameraTransform(
-        base=2.0, linSideBreak=[par['lb']] * 3,
-        logSideSlope=[par['gs']] * 3, logSideOffset=[par['go']] * 3,
-        linSideSlope=[par['ls']] * 3, linSideOffset=[par['lo']] * 3,
-        linearSlope=[par['sl']] * 3))
-grp.appendTransform(lut)
-
-md = grp.getFormatMetadata()
-md.setID('%s__%s' % (nodes[-1].name(), short))
-md.setName(nodes[-1].name())
-child(md, 'InputDescriptor', preset if log_input else 'Linear (%s shaper)' % preset)
-child(md, 'OutputDescriptor', nodes[-1].name())
-nb = child(child(md, 'Info'), 'NukeBake')
-nb['version'] = '1'
-sh = child(nb, 'Shaper')
-sh['preset'] = preset
-sh['shortname'] = short
-sh['cube_size'] = str(size)
-sh['embedded'] = 'false' if log_input else 'true'
-for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl'):
-    sh[k] = repr(par[k])
-for k in ('w0', 'o', 'x0', 'y0', 'k'):
-    sh[k] = repr(shaper[k].value())
-ns = child(nb, 'Nodes')
-for n in nodes:
-    e = child(ns, 'Node')
-    e['class'] = n.Class()
-    e['name'] = n.name()
-    for name, val in knob_values(n):
-        child(e, 'Knob', val)['name'] = name
-g = child(nb, 'Generator')
-g['nuke'] = nuke.NUKE_VERSION_STRING
-g['ocio'] = ocio.__version__
-g['date'] = datetime.datetime.now().isoformat(timespec='seconds')
-g['script'] = nuke.root().name()
-grp.write(config=cfg, formatName=fmt, fileName=path)
-try:
-    os.remove(tmp)
-except OSError:
-    pass
+    shaper_node['pattern'].setValue(False)
+size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input)
+os.remove(tmp)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)' % (
-    os.path.basename(path), len(nodes), size, 'log input' if log_input else short))
-'''.replace('__SHORT__', repr([p[1] for p in PRESETS]))
+    os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname']))
+'''
 
 
-RESTORE = r'''import xml.etree.ElementTree as ET
-import nuke
-
+RESTORE = COMMON + r'''
 gen = nuke.thisNode()
-MARK = 'clfbake_shaper'
-path = gen['file'].evaluate()
-root = ET.parse(path).getroot()
-
-
-def tag(e):
-    return e.tag.split('}')[-1]
-
-
-def find(e, name):
-    for c in e.iter():
-        if tag(c) == name:
-            return c
-
-
-nb = find(root, 'NukeBake')
-if nb is None:
-    raise RuntimeError('%s has no NukeBake metadata' % path)
-
+nb = read_bake(gen['file'].evaluate())
 targets = [n for n in nuke.thisParent().nodes() if n.isSelected()]
 if not targets:
-    targets, n = [], gen.input(0)
+    n = gen.input(0)
     while n is not None:
         targets.append(n)
         if MARK in n.knobs():
             break
         n = n.input(0)
-targets = list(targets)
-done = []
-
-sh = find(nb, 'Shaper')
-for t in targets:
-    if sh is not None and MARK in t.knobs():
-        t['preset'].setValue(sh.get('preset'))
-        for k in ('w0', 'o', 'x0', 'y0', 'k'):
-            if sh.get(k) is not None:
-                t[k].setValue(float(sh.get(k)))
-        t['cube_size'].setValue(int(sh.get('cube_size', 48)))
-        gen['log_input'].setValue(sh.get('embedded') == 'false')
-        done.append(t.name())
-        targets.remove(t)
-        break
-
-for e in find(nb, 'Nodes') or []:
-    cls = e.get('class')
-    match = None
-    for t in targets:
-        if t.Class() == cls:
-            match = t
-            break
-    if match is None:
-        continue
-    targets.remove(match)
-    for k in e:
-        name = k.get('name')
-        if name in match.knobs():
-            try:
-                match[name].fromScript(k.text or '')
-            except Exception:
-                pass
-    done.append('%s <- %s' % (match.name(), e.get('name')))
-
+done, sh = restore_apply(nb, targets)
+if sh is not None:
+    gen['log_input'].setValue(sh.get('embedded') == 'false')
 gen['status'].setValue('restored: %s' % (', '.join(done) or 'nothing matched (select the nodes to restore)'))
 '''
+
+
+# Thin buttons for OpenDRT.nk: fixed T-LogE shaper at 48^3, tetrahedral, embedded.
+OPENDRT_SHAPER = dict(preset_params(0), preset=PRESETS[0][0], shortname=PRESETS[0][1], cube_size=48,
+                      **dict(XLOG_DEFAULTS))
+OPENDRT_SHAPER['logbreak'] = (OPENDRT_SHAPER['gs'] * math.log(OPENDRT_SHAPER['ls'] * OPENDRT_SHAPER['lb']
+                              + OPENDRT_SHAPER['lo'], 2) + OPENDRT_SHAPER['go'])
+OPENDRT_SHAPER['linoff'] = OPENDRT_SHAPER['logbreak'] - OPENDRT_SHAPER['sl'] * OPENDRT_SHAPER['lb']
+
+OPENDRT_BAKE = COMMON + r'''
+SHAPER = __SHAPER__
+EXPR = __EXPR__
+n = nuke.thisNode()
+path = n['clf_file'].evaluate() or default_path(n, SHAPER['shortname'])
+n['clf_file'].setValue(path)
+src = n.input(0)
+with nuke.thisParent():
+    pat = nuke.nodes.CMSTestPattern(cube_size=SHAPER['cube_size'])
+    inv = nuke.nodes.Expression(inputs=[pat], expr0=EXPR[0], expr1=EXPR[1], expr2=EXPR[2])
+    lut = nuke.nodes.GenerateLUT(inputs=[n])
+n.setInput(0, inv)
+try:
+    tmp = bake_cube(lut)
+finally:
+    n.setInput(0, src)
+    for t in (lut, inv, pat):
+        nuke.delete(t)
+write_clf(path, tmp, SHAPER, [n], 'tetrahedral', False)
+os.remove(tmp)
+nuke.message('wrote %s' % path)
+'''.replace('__SHAPER__', repr(OPENDRT_SHAPER)).replace(
+    '__EXPR__', repr([inverse_expr(c, OPENDRT_SHAPER) for c in 'rgb']))
+
+OPENDRT_RESTORE = COMMON + r'''
+n = nuke.thisNode()
+done, sh = restore_apply(read_bake(n['clf_file'].evaluate()), [n])
+nuke.message('restored %s' % (', '.join(done) or 'nothing'))
+'''
+
+
+def script(body):
+    """PyScript knobs run in __main__; keep every name inside one function."""
+    return 'def __clfbake():\n' + ''.join('    ' + l + '\n' if l.strip() else '\n'
+                                           for l in body.splitlines()) + '__clfbake()\n'
+
+
+SHAPER_KNOBCHANGED = r"""n = nuke.thisNode()
+if nuke.thisKnob().name() in ('preset', 'showPanel'):
+    x = n['preset'].getValue() == %d
+    for k in ('w0', 'o', 'x0', 'y0', 'k'):
+        n[k].setVisible(x)
+""" % XLOG
 
 
 def build_shaper():
@@ -270,32 +335,30 @@ def build_shaper():
     pat = nuke.nodes.CMSTestPattern(name='CMSTestPattern1')
     pat['cube_size'].setExpression('parent.cube_size')
     inv = nuke.nodes.Expression(name='InverseShaper', inputs=[pat])
+    par = dict((k, 'parent.' + k) for k in ('logbreak', 'linoff', 'sl', 'go', 'gs', 'lo', 'ls'))
     for i, c in enumerate('rgb'):
-        inv['expr%d' % i].setValue(
-            '%s<=parent.logbreak?(%s-parent.linoff)/parent.sl:(pow(2,(%s-parent.go)/parent.gs)-parent.lo)/parent.ls'
-            % (c, c, c))
+        inv['expr%d' % i].setValue(inverse_expr(c, par))
     sw = nuke.nodes.Switch(name='Switch1', inputs=[inp, inv])
     sw['which'].setExpression('parent.pattern')
     nuke.nodes.Output(name='Output1', inputs=[sw])
     g.end()
 
     g.addKnob(nuke.Tab_Knob('CLFShaper'))
-    about = nuke.Text_Knob('about', ' ',
+    g.addKnob(nuke.Text_Knob('about', ' ',
         '<font color=#ccc><b>CLFShaper</b> | part of <a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>'
-        'Place at the head of the chain to bake. CLFGenerate goes at the tail.')
-    g.addKnob(about)
+        'Place at the head of the chain to bake. CLFGenerate goes at the tail.'))
     k = nuke.Enumeration_Knob('preset', 'shaper', [p[0] for p in PRESETS])
     k.setTooltip('Log encoding used to shape the 3D LUT domain. The exact same curve is written '
                  'into the CLF as a parametric Log node, so the LUT takes linear input. '
                  'T-LogE is what the released OpenDRT OCIO config uses.')
     g.addKnob(k)
-    for name, label, val, lo, hi, tip in (
-            ('w0', 'w0', 128.0, 10, 256, 'XLog: linear value that maps to 1.0'),
-            ('o', 'o', 7.5, 0, 12, 'XLog: log asymptote offset, as 2^-o'),
-            ('x0', 'x0', 0.0, 0, 0.5, 'XLog: lower intersection constraint x'),
-            ('y0', 'y0', 0.075, 0, 0.5, 'XLog: lower intersection constraint y'),
-            ('k', 'k', 0.06, 0, 0.2, 'XLog: slope of the linear extension')):
-        d = nuke.Double_Knob(name, label)
+    for (name, val), (lo, hi, tip) in zip(XLOG_DEFAULTS, (
+            (10, 256, 'XLog: linear value that maps to 1.0'),
+            (0, 12, 'XLog: log asymptote offset, as 2^-o'),
+            (0, 0.5, 'XLog: lower intersection constraint x'),
+            (0, 0.5, 'XLog: lower intersection constraint y'),
+            (0, 0.2, 'XLog: slope of the linear extension'))):
+        d = nuke.Double_Knob(name, name)
         d.setRange(lo, hi)
         d.setValue(val)
         d.setTooltip(tip)
@@ -345,7 +408,7 @@ def build_shaper():
     g['preset'].setValue(0)
     g['label'].setValue('[value preset]')
     g['tile_color'].setValue(0x4a3a7aff)
-    for name in ('w0', 'o', 'x0', 'y0', 'k'):
+    for name, _ in XLOG_DEFAULTS:
         g[name].setVisible(False)
     return g
 
@@ -356,7 +419,6 @@ def build_generate():
     inp = nuke.nodes.Input(name='Input1')
     lut = nuke.nodes.GenerateLUT(name='GenerateLUT1', inputs=[inp])
     lut['file_type'].setValue('.cube')
-    lut['file'].setValue('[value parent.tmp_cube]')
     nuke.nodes.Output(name='Output1', inputs=[inp])
     g.end()
 
@@ -375,23 +437,60 @@ def build_generate():
                  'the way the released OpenDRT OCIO config consumes its cubes. '
                  'Default off: the shaper is embedded and the CLF takes linear input.')
     g.addKnob(k)
-    k = nuke.PyScript_Knob('generate', 'Generate', GENERATE)
+    k = nuke.PyScript_Knob('generate', 'Generate', script(GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS]))))
     k.setFlag(nuke.STARTLINE)
     k.setTooltip('Bake the chain to a 3D LUT via GenerateLUT, then write the CLF with the shaper and node parameters embedded.')
     g.addKnob(k)
-    k = nuke.PyScript_Knob('restore', 'Restore', RESTORE)
+    k = nuke.PyScript_Knob('restore', 'Restore', script(RESTORE))
     k.setTooltip('Read the CLF and apply the recorded parameters to the selected nodes (or to the upstream chain if nothing is selected).')
     g.addKnob(k)
     g.addKnob(nuke.Text_Knob('status', ' ', ''))
-    k = nuke.String_Knob('tmp_cube', '', '')
-    k.setFlag(nuke.INVISIBLE)
-    g.addKnob(k)
     g['tile_color'].setValue(0x4a3a7aff)
     return g
 
 
+def opendrt_knob_lines():
+    """Knob definitions for the CLF Helpers group, escaped by Nuke."""
+    g = nuke.nodes.Group(name='clfhelpers_tmp')
+    g.addKnob(nuke.Tab_Knob('clf_grp', 'CLF Helpers', nuke.TABBEGINCLOSEDGROUP))
+    k = nuke.File_Knob('clf_file', 'file')
+    k.setTooltip('CLF (or .ctf) path. Empty: next to the script, named after this node.')
+    g.addKnob(k)
+    k = nuke.PyScript_Knob('bake_clf', 'Bake CLF', script(OPENDRT_BAKE))
+    k.setTooltip('Bake this node to a CLF: T-LogE shaper (as in the OpenDRT OCIO config) embedded as a '
+                 'parametric Log node, 48^3 tetrahedral LUT3D, and every parameter stored in the metadata. '
+                 'For other shapers, sizes, or baking a chain of nodes use CLFShaper + CLFGenerate from utilities/nuke/CLFBake.nk.')
+    g.addKnob(k)
+    k = nuke.PyScript_Knob('restore_clf', 'Restore CLF', script(OPENDRT_RESTORE))
+    k.setTooltip('Apply the parameters recorded in the CLF to this node.')
+    g.addKnob(k)
+    g.addKnob(nuke.Tab_Knob('endGroup_clf', '', nuke.TABENDGROUP))
+    for n in nuke.allNodes():
+        n.setSelected(n is g)
+    tmp = os.path.join(HERE, '.clfhelpers_tmp.nk')
+    nuke.nodeCopy(tmp)
+    lines = open(tmp).read().splitlines()
+    os.remove(tmp)
+    nuke.delete(g)
+    start = next(i for i, l in enumerate(lines) if 'addUserKnob {20 clf_grp' in l)
+    end = next(i for i, l in enumerate(lines) if 'addUserKnob {20 endGroup_clf' in l)
+    return lines[start:end + 1]
+
+
+def splice_opendrt(path, new):
+    lines = open(path).read().splitlines()
+    starts = [i for i, l in enumerate(lines) if 'addUserKnob {20 clf_grp' in l]
+    if starts:
+        end = next(i for i, l in enumerate(lines) if 'addUserKnob {20 endGroup_clf' in l)
+        lines[starts[0]:end + 1] = new
+    else:
+        anchor = next(i for i, l in enumerate(lines) if 'addUserKnob {20 endGroup_1' in l)
+        lines[anchor + 1:anchor + 1] = new
+    open(path, 'w').write('\n'.join(lines) + '\n')
+
+
 def main():
-    out = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(sys.argv[0])), 'CLFBake.nk')
+    out = os.path.join(HERE, 'CLFBake.nk')
     s = build_shaper()
     g = build_generate()
     g.setInput(0, s)
@@ -404,6 +503,8 @@ def main():
              if not l.startswith('version ') and l.strip() != 'selected true']
     open(out, 'w').write('\n'.join(lines) + '\n')
     print('wrote', out)
+    splice_opendrt(os.path.normpath(OPENDRT), opendrt_knob_lines())
+    print('spliced CLF Helpers into', os.path.normpath(OPENDRT))
 
 
 if __name__ == '__main__':
