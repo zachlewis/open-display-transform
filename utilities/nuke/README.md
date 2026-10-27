@@ -91,14 +91,16 @@ domain fitting, or a chain of nodes.
       </Model>
       <Mastering>
         <DisplayColorVolume gamut="Rec.709" maxLuminance="100.0" minLuminance="0.0"
-                            red="0.64 0.33" green="0.3 0.6" blue="0.15 0.06" white="0.3127 0.329"/>
+                            red="0.64 0.33" green="0.3 0.6" blue="0.15 0.06" white="0.3127 0.329"
+                            contentWhite="0.3127 0.329"/>   <!-- white: container; contentWhite: creative white -->
         <Luminance peak="100.0" greyNominal="10" greyMeasured="11.5" diffuseWhiteMeasured="50.5"
                    measuredFrom="chain output for neutral 0.18 and 1.0, decoded with the output EOTF"/>
-        <ViewingEnvironment surround="dim" ambient="video, 5 nit surround"/>
-        <CreativeWhite whitepoint="D65" limit="0.25"/>
+        <ViewingEnvironment surround="dim" condition="video100" ambient="video, 5 nit surround"/>
+        <CreativeWhite whitepoint="D65" limit="0.25" note="..."/>
         <CICP primaries="1" transfer="1" matrix="0" fullRange="true" note="..."/>
       </Mastering>
-      <Interop input="lin_ap1_scene" output="g24_rec709_display"/>
+      <Interop input="lin_ap1_scene" output="g24_rec709_display" namespace="opendrt-v1.1"
+               [inputFallback=".." outputFallback=".." outputConform=".."]/>
       <Script>...the baked nodes as a .nk snippet (nuke.nodeCopy), for From CLF; optional...</Script>
       <Generator nuke="16.0v4" date="..." script="..."/>
     </NukeBake>
@@ -137,13 +139,49 @@ shows up as grey above nominal), the viewing `surround`, the `CreativeWhite`,
 and the ITU-T H.273 `CICP` code points for the output encoding where they are
 unambiguous (transfer 1 for 2.4-power Rec.1886 is the broadcast convention).
 
-**Interop** carries ASWF Color Interop IDs only where the mapping is exact:
-input from the OpenDRT input gamut when the shaper is embedded (ACES, ACEScg,
-P3-D65, Rec.2020, Rec.709 map; camera gamuts have no published CIID), output
-from the EOTF and display gamut pair (`g24_rec709_display`,
-`pq_rec2020_display`, `hlg_rec2020_display`, …). Display P3 at pure 2.2 power
-and DCDM X'Y'Z' are deliberately unmapped because the published CIIDs mean the
-sRGB piecewise curve and a headroom-scaled DCDM respectively.
+**Interop** carries ASWF Color Interop IDs for input and output, always. A
+published CIF ID is used bare when the encoding is exactly the published one.
+Anything OpenDRT-defined, or a published base with modifiers, is an
+organisation ID in the `opendrt-v<major.minor>:` namespace per CIF Rec 03,
+with `inputFallback` / `outputFallback` naming the published base where one
+exists. Modifiers are appended to the base with `|`:
+
+| Modifier | Meaning |
+|---|---|
+| `p3lim` | Rec.2020 container limited to P3 |
+| `d60sim`, `d55sim`, `d93sim`, … | creative white other than D65. OpenDRT adapts the creative white to D65 for the render and D65 to the output container, so a non-D65 container (P3-DCI, P3-D60, X'Y'Z') carries D65 content white unmodified; that is the implied case. |
+| `dw<N>` | diffuse white (scene 1.0) luminance in cd/m², measured, HDR encodings only |
+| `clamp0` | the clamp knob is off, output may leave [0,1] |
+| `EE` | log code values in, full range out (log input mode) |
+
+Examples: `g24_rec709_display`; `opendrt-v1.1:pq_rec2020_display|p3lim|dw148`
+(fallback `pq_rec2020_display`); `opendrt-v1.1:g26_p3dci_display`;
+`opendrt-v1.1:lin_egamut2_scene` for a camera-gamut input;
+`opendrt-v1.1:tloge_egamut2_scene` for a log-input bake.
+
+Two outputs earn their published ID by a conforming `Matrix` appended after
+the `LUT3D`, recorded as `outputConform` on the Interop element and noted in
+the OutputDescriptor:
+
+- DCDM `g26_xyzd65_display`: OpenDRT encodes X'Y'Z' with D65 content white and
+  peak at code 1.0; the published definition has the 52.37 cd/m² headroom with
+  48 cd/m² white, so the codes are scaled by (48/52.37)^(1/2.6). Exact, since
+  the power function is separable.
+- `ocio:lin_ciexyzd65_display`, OpenColorIO's CIE XYZ D65 display interchange,
+  which puts 1.0 at 100 cd/m²: set OpenDRT to EOTF Linear and gamut X'Y'Z'
+  and the CLF is scaled by peak luminance / 100. The result plugs into any OCIO
+  config as a view transform (scene reference to `cie_xyz_d65_interchange`)
+  with the config's own display colorspaces doing the encoding.
+
+`pq_xyzd65_display` needs no conform: PQ already encodes absolute nits.
+Display P3 at pure 2.2 power is `opendrt-v1.1:g22_p3d65_display` because the
+published Display P3 ID means the sRGB piecewise curve.
+
+`ViewingEnvironment` also carries a FilmLight-style `condition` token built
+from surround class, gamut and peak: `cinema48`, `video100`, `office100`,
+`videowide1000`. Dark surround is `cinema` and implies a wide gamut, so
+`cinema1000` rather than `cinemawide1000`. The exact FilmLight vocabulary was
+not checked against Baselight; the scheme follows the examples given.
 
 Not yet written: the SMPTE CLF broadcast profile metadata ("CLF4"), which
 OpenColorIO implements. That belongs to bakes whose input or output is not
@@ -199,7 +237,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | auto keeps a sufficient preset | `domain: auto` leaves a preset alone when it already covers the chain. | exact |
 | fit: CLF vs Nuke, above top, below floor | A fitted XLog matches within interpolation error, clamping beyond the fitted top costs nothing, and the floor is within tolerance. | 3e-2 / 5e-3 / 3e-2 |
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
-| metadata (sdr rec1886, pq rec2020 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP and Interop IDs are right for an SDR and a PQ configuration; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; `embed node script` off omits the script. | exact / 3% |
+| metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |
 
 Reference numbers on the OpenDRT test chain at 48³: lattice 1e-6, image
 7.8e-3, fitted image 9.9e-3. If a change moves these by more than a little,
@@ -252,8 +290,10 @@ Where things live in the builder:
 - **Metadata schema**: `write_clf`. Bump `NukeBake version` if you change the
   element structure, and keep `read_bake`/`restore_apply` reading old files.
 - **Model and mastering metadata**: `OPENDRT_MODEL` (module → parameter ids),
-  the `XY`, `INTEROP_IN`, `INTEROP_OUT`, `CICP_*` tables, `to_nits` (output
-  EOTF decode) and `describe_opendrt`. A new OpenDRT version that adds a
+  the `XY`, `CWP_XY`, `GAMUT_SHORT`, `EOTF_SHORT`, `CONTAINER_SHORT`,
+  `PUBLISHED_IN`, `PUBLISHED_OUT` (published IDs and their conforming scales),
+  `CICP_*` tables, `to_nits` (output EOTF decode), `interop_ids` (namespace,
+  modifiers, fallback, conform) and `describe_opendrt`. A new OpenDRT version that adds a
   parameter needs its id added to the module table; a new recognised model
   needs an `is_<model>` test and a describer called from `write_clf`.
 - **Probe ramps**: the `ProbeRamp` expressions in `build_shaper` and the

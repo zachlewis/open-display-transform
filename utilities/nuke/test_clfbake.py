@@ -292,10 +292,22 @@ rebake_matches('opendrt button', clf2)     # the OpenDRT button's own bake
 import xml.etree.ElementTree as ET
 
 
-def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None):
+def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None, conform=None, tail=None):
     nb = ET.parse(path).getroot().find('Info/NukeBake')
     model, mast, inter = nb.find('Model'), nb.find('Mastering'), nb.find('Interop')
     problems = []
+    if callable(expect_out):
+        expect_out = expect_out(nb)
+    got_conform = float(inter.get('outputConform')) if inter is not None and inter.get('outputConform') else None
+    if (conform is None) != (got_conform is None) or (conform is not None and abs(got_conform - conform) > 1e-9):
+        problems.append('outputConform %s vs %s' % (got_conform, conform))
+    if conform is not None and tail is not None:
+        # the CLF must equal the node's output times the conforming scale
+        lin = sample(img, W, H)
+        via = [[c / conform for c in p] for p in apply_clf(path, lin)]   # compare in the node's own units
+        err = max_err(via, sample(tail, W, H))
+        if err > IMAGE_TOL:
+            problems.append('conformed output err %.2e' % err)
     if model is None or model.get('name') != 'OpenDRT' or not model.get('version'):
         problems.append('Model element')
     else:
@@ -338,8 +350,9 @@ def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None
         failures.append('metadata ' + name)
 
 
-# SDR, default "dim" surround lifts grey above nominal, so only presence is checked
-meta_checks('sdr rec1886', clf, drt, 'g24_rec709_display', ('1', '1'), None)
+# SDR, default "dim" surround lifts grey above nominal, so only presence is checked;
+# the default input gamut (Filmlight E-Gamut) has no published CIID -> namespaced
+meta_checks('sdr rec1886', clf, drt, 'g24_rec709_display', ('1', '1'), None, in_id='opendrt-v1.1:lin_egamut_scene')
 # PQ Rec.2100 1000 nit on a fresh node, with a mappable input gamut
 d4 = paste(OPENDRT)[0]
 d4.setInput(0, img)
@@ -361,8 +374,39 @@ clf_pq = os.path.join(OUT, 'test_pq.clf')
 g3['file'].setValue(clf_pq)
 g3['generate'].execute()
 assert '<Script>' not in open(clf_pq).read(), 'embed_script off must omit the script'
-meta_checks('pq rec2020 1000nit', clf_pq, d4, 'pq_rec2020_display', ('9', '16'),
+
+
+def pq_expect(nb):   # P3-limited container and HDR diffuse white are modifiers on the published base
+    dw = int(round(float(nb.find('Mastering/Luminance').get('diffuseWhiteMeasured'))))
+    return 'opendrt-v1.1:pq_rec2020_display|p3lim|dw%d' % dw
+
+
+meta_checks('pq rec2020 1000nit', clf_pq, d4, pq_expect, ('9', '16'),
             d4['tn_Lg'].value() * (1 + d4['tn_gb'].value() * math.log(10, 2)), in_id='lin_ap1_scene')
+nb_pq = ET.parse(clf_pq).getroot().find('Info/NukeBake')
+cond = nb_pq.find('Mastering/ViewingEnvironment').get('condition')
+fb = nb_pq.find('Interop').get('outputFallback')
+print('%s pq viewing condition / fallback: %s / %s' % ('PASS' if (cond, fb) == ('cinema1000', 'pq_rec2020_display') else 'FAIL', cond, fb))
+if (cond, fb) != ('cinema1000', 'pq_rec2020_display'):   # dark surround = cinema, wide gamut implied
+    failures.append('pq condition/fallback')
+
+# DCDM X'Y'Z' 2.6: published ID earned by the 48/52.37 conforming scale
+d4['eotf'].setValue('2.6 Power DCI')
+d4['display_gamut'].setValue("X'Y'Z'")
+d4['tn_Lp'].setValue(100)
+clf_xyz = os.path.join(OUT, 'test_xyz.clf')
+g3['file'].setValue(clf_xyz)
+g3['generate'].execute()
+meta_checks('dcdm xyz 2.6', clf_xyz, d4, 'g26_xyzd65_display', ('10', '17'), None, in_id='lin_ap1_scene',
+            conform=(48.0 / 52.37) ** (1 / 2.6), tail=d4)
+# linear CIE XYZ D65 at 1000 nit peak: OCIO display interchange, 1.0 = 100 cd/m2, so scale 10
+d4['eotf'].setValue('Linear')
+d4['tn_Lp'].setValue(1000)
+clf_lx = os.path.join(OUT, 'test_linxyz.clf')
+g3['file'].setValue(clf_lx)
+g3['generate'].execute()
+meta_checks('linear xyz 1000nit', clf_lx, d4, 'ocio:lin_ciexyzd65_display', ('10', '8'), None, in_id='lin_ap1_scene',
+            conform=10.0, tail=d4)
 
 print('outputs in', OUT)
 if failures:

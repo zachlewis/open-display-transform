@@ -172,28 +172,52 @@ OPENDRT_MODEL = (
     ('HueShiftCMY', ('hs_cmy_enable', 'hs_c', 'hs_c_rng', 'hs_m', 'hs_m_rng', 'hs_y', 'hs_y_rng')),
     ('Output', ('eotf', 'display_gamut', 'clamp', 'display_name')),
 )
-# CIE xy of the OpenDRT display gamuts: (R, G, B, white), ST 2086 style
+# CIE xy of the OpenDRT display containers: (R, G, B, container white), ST 2086 style.
+# X'Y'Z' has no primaries; its container white is E.
 XY = {
     'Rec.709': ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06), (0.3127, 0.3290)),
     'P3-D65': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.3127, 0.3290)),
     'Rec.2020 (P3 Limited)': ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), (0.3127, 0.3290)),
     'P3-D60': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.32168, 0.33767)),
     'P3-DCI': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.314, 0.351)),
+    "X'Y'Z'": (None, None, None, (1 / 3., 1 / 3.)),
 }
-# Color Interop IDs (ASWF CIF Rec 01 / Rec 02) where the mapping is exact. Everything else is omitted.
-INTEROP_IN = {'ACES': 'lin_ap0_scene', 'ACEScg': 'lin_ap1_scene', 'P3D65': 'lin_p3d65_scene',
-              'Rec.2020': 'lin_rec2020_scene', 'Rec.709': 'lin_rec709_scene'}
-INTEROP_OUT = {
-    ('2.4 Power - Rec.1886', 'Rec.709'): 'g24_rec709_display',
-    ('2.2 Power - sRGB Display', 'Rec.709'): 'g22_rec709_display',
-    ('2.6 Power DCI', 'P3-D65'): 'g26_p3d65_display',
-    ('PQ', 'Rec.2020 (P3 Limited)'): 'pq_rec2020_display',
-    ('PQ', 'P3-D65'): 'pq_p3d65_display',
-    ('HLG', 'Rec.2020 (P3 Limited)'): 'hlg_rec2020_display',
-    ('Linear', 'Rec.709'): 'lin_rec709_display',
-    ('Linear', 'P3-D65'): 'lin_p3d65_display',
-    ('Linear', 'Rec.2020 (P3 Limited)'): 'lin_rec2020_display',
+CWP_XY = {'D93': (0.2831, 0.2971), 'D75': (0.2990, 0.3149), 'D65': (0.3127, 0.3290),
+          'D60': (0.32168, 0.33767), 'D55': (0.3324, 0.3474), 'D50': (0.3457, 0.3585)}
+
+# --- Color Interop IDs -----------------------------------------------------------
+# Published CIF IDs are used bare when the encoding is exactly the published one.
+# Anything OpenDRT-defined, or a published base with modifiers, is namespaced
+# "opendrt-v<major.minor>:" per CIF Rec 03 (organisation ID, published base as
+# fallback). Modifiers are appended to the base with "|":
+#   p3lim                 Rec.2020 container limited to P3
+#   d60sim d55sim ...     creative white other than D65 (D65 in a non-D65
+#                         container is the implied, unmodified case)
+#   dw<N>                 diffuse white (scene 1.0) luminance in cd/m2, HDR only
+#   clamp0                the clamp knob is off, output may leave [0,1]
+#   EE                    log code values in, full range out (log input mode)
+GAMUT_SHORT = {'ACES': 'ap0', 'ACEScg': 'ap1', 'P3D65': 'p3d65', 'Rec.2020': 'rec2020', 'Rec.709': 'rec709',
+               'Arri WideGamut 3': 'awg3', 'Arri WideGamut 4': 'awg4', 'Red WideGamutRGB': 'rwg',
+               'Sony SGamut3': 'sgamut3', 'Filmlight E-Gamut': 'egamut', 'Filmlight E-Gamut2': 'egamut2',
+               'DaVinci Wide Gamut': 'dwg'}
+PUBLISHED_IN = ('lin_ap0_scene', 'lin_ap1_scene', 'lin_p3d65_scene', 'lin_rec2020_scene', 'lin_rec709_scene')
+EOTF_SHORT = {'Linear': 'lin', '2.2 Power - sRGB Display': 'g22', '2.4 Power - Rec.1886': 'g24',
+              '2.6 Power DCI': 'g26', 'PQ': 'pq', 'HLG': 'hlg'}
+CONTAINER_SHORT = {'Rec.709': 'rec709', 'P3-D65': 'p3d65', 'Rec.2020 (P3 Limited)': 'rec2020',
+                   'P3-D60': 'p3d60', 'P3-DCI': 'p3dci', "X'Y'Z'": 'xyzd65'}
+# published display IDs, and the conforming scale (applied as a Matrix after the
+# LUT3D) that makes OpenDRT's output match the published definition exactly:
+#   DCDM X'Y'Z' is normalised to 52.37 cd/m2 with 48 cd/m2 white, OpenDRT to peak;
+#   OCIO's CIE XYZ D65 display interchange puts 1.0 at 100 cd/m2, OpenDRT at peak.
+PUBLISHED_OUT = {
+    'g24_rec709_display': None, 'g22_rec709_display': None, 'lin_rec709_display': None,
+    'g26_p3d65_display': None, 'pq_p3d65_display': None, 'lin_p3d65_display': None,
+    'pq_rec2020_display': None, 'hlg_rec2020_display': None, 'lin_rec2020_display': None,
+    'pq_xyzd65_display': None,
+    'g26_xyzd65_display': (48.0 / 52.37) ** (1 / 2.6),
+    'ocio:lin_ciexyzd65_display': 'lp/100',
 }
+OUT_ALIAS = {'lin_xyzd65_display': 'ocio:lin_ciexyzd65_display'}
 # ITU-T H.273 code points for the output encoding (RGB, full range)
 CICP_PRIMARIES = {'Rec.709': 1, 'P3-D65': 12, 'Rec.2020 (P3 Limited)': 9, 'P3-DCI': 11, "X'Y'Z'": 10}
 CICP_TRANSFER = {'Linear': 8, '2.2 Power - sRGB Display': 4, '2.4 Power - Rec.1886': 1,
@@ -228,11 +252,50 @@ def to_nits(v, eotf, lp):
     return lp * v ** {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
 
 
-def describe_opendrt(nb, node, log_input, measured):
-    """Append <Model>, <Mastering> and <Interop> for an OpenDRT node."""
+def interop_ids(node, ns, log_input, shaper, measured):
+    """(input id, input fallback, output id, output fallback, conform scale or None)."""
+    gam, eotf, cont = node['in_gamut'].value(), node['eotf'].value(), node['display_gamut'].value()
+    cwp, lp = node['cwp'].value(), node['tn_Lp'].value()
+    g = GAMUT_SHORT.get(gam, 'unknown')
+    if log_input:
+        if shaper['shortname'] == 'acescct' and g == 'ap1':
+            in_id, in_fb = 'ocio:acescct_ap1_scene', None
+        else:
+            in_id, in_fb = '%s:%s_%s_scene' % (ns, shaper['shortname'], g), None
+    else:
+        base = 'lin_%s_scene' % g
+        in_id, in_fb = (base, None) if base in PUBLISHED_IN else ('%s:%s' % (ns, base), None)
+    base = '%s_%s_display' % (EOTF_SHORT[eotf], CONTAINER_SHORT[cont])
+    base = OUT_ALIAS.get(base, base)
+    conform = PUBLISHED_OUT.get(base)
+    if conform == 'lp/100':
+        conform = lp / 100.0
+    mods = []
+    if cont == 'Rec.2020 (P3 Limited)':
+        mods.append('p3lim')
+    if cwp != 'D65':
+        mods.append(cwp.lower() + 'sim')
+    if eotf in ('PQ', 'HLG') and measured:
+        mods.append('dw%d' % int(round(to_nits(sum(measured[1]) / 3.0, eotf, lp))))
+    if not node['clamp'].value():
+        mods.append('clamp0')
+    if log_input:
+        mods.append('EE')
+    published = base in PUBLISHED_OUT
+    if published and not mods:
+        out_id, out_fb = base, None
+    else:
+        out_id, out_fb = '%s:%s' % (ns, '|'.join([base] + mods)), (base if published else None)
+    return in_id, in_fb, out_id, out_fb, (conform if abs((conform or 1.0) - 1.0) > 1e-9 else None)
+
+
+def describe_opendrt(nb, node, log_input, measured, shaper):
+    """Append <Model>, <Mastering> and <Interop> for an OpenDRT node. Returns a
+    conforming output scale to append as a Matrix node, or None."""
     import re
     about = node['about_label'].value() if 'about_label' in node.knobs() else ''
     ver = re.search(r'v(\d+\.\d+\.\d+)', about)
+    ns = 'opendrt-v' + ('.'.join(ver.group(1).split('.')[:2]) if ver else 'unknown')
     model = ET.SubElement(nb, 'Model', name='OpenDRT', node=node.name())
     if ver:
         model.set('version', ver.group(1))
@@ -254,7 +317,11 @@ def describe_opendrt(nb, node, log_input, measured):
     if gamut in XY:
         r, g, b, w = XY[gamut]
         for name, xy in (('red', r), ('green', g), ('blue', b), ('white', w)):
-            dcv.set(name, '%g %g' % xy)
+            if xy is not None:
+                dcv.set(name, '%g %g' % xy)
+    cwp = node['cwp'].value()
+    if cwp in CWP_XY:
+        dcv.set('contentWhite', '%g %g' % CWP_XY[cwp])   # creative white; "white" is the container's
     if gamut == 'Rec.2020 (P3 Limited)':
         dcv.set('limitedTo', 'P3-D65')
     # greyNominal: tn_Lg with grey boost, i.e. the tonescale constraint before
@@ -267,20 +334,30 @@ def describe_opendrt(nb, node, log_input, measured):
         lum.set('diffuseWhiteMeasured', '%.4g' % to_nits(sum(white) / 3.0, eotf, lp))
         lum.set('measuredFrom', 'chain output for neutral 0.18 and 1.0, decoded with the output EOTF')
     su = node['tn_su'].value()
-    ET.SubElement(mast, 'ViewingEnvironment', surround=su,
+    # viewing condition token in the FilmLight style: <class><wide?><peak nits>
+    cls = {'dark': 'cinema', 'dim': 'video', 'bright': 'office'}.get(su, su)
+    wide = 'wide' if cls != 'cinema' and gamut != 'Rec.709' else ''
+    ET.SubElement(mast, 'ViewingEnvironment', surround=su, condition='%s%s%d' % (cls, wide, int(round(lp))),
                   ambient={'dark': 'theatre, dark surround', 'dim': 'video, 5 nit surround',
                            'bright': 'office or living room surround'}.get(su, ''))
-    ET.SubElement(mast, 'CreativeWhite', whitepoint=node['cwp'].value(), limit=fmt(node['cwp_lm'].value()))
+    ET.SubElement(mast, 'CreativeWhite', whitepoint=cwp, limit=fmt(node['cwp_lm'].value()),
+                  note='adapted to D65 for the render, then D65 to the output container; '
+                       'a non-D65 container therefore carries D65 content white unless modified')
     if gamut in CICP_PRIMARIES and eotf in CICP_TRANSFER:
         ET.SubElement(mast, 'CICP', primaries=str(CICP_PRIMARIES[gamut]), transfer=str(CICP_TRANSFER[eotf]),
                       matrix='0', fullRange='true', note='ITU-T H.273; transfer 1 signals BT.709/BT.1886 by convention')
-    interop = {}
-    if not log_input and node['in_gamut'].value() in INTEROP_IN:
-        interop['input'] = INTEROP_IN[node['in_gamut'].value()]
-    if (eotf, gamut) in INTEROP_OUT:
-        interop['output'] = INTEROP_OUT[(eotf, gamut)]
-    if interop:
-        ET.SubElement(nb, 'Interop', interop)
+    in_id, in_fb, out_id, out_fb, conform = interop_ids(node, ns, log_input, shaper, measured)
+    inter = ET.SubElement(nb, 'Interop', input=in_id, output=out_id, namespace=ns)
+    if in_fb:
+        inter.set('inputFallback', in_fb)
+    if out_fb:
+        inter.set('outputFallback', out_fb)
+    if conform is not None:
+        inter.set('outputConform', repr(conform))
+        inter.set('outputConformNote', 'Matrix appended after the LUT3D so the output matches the published '
+                  'definition: DCDM 48/52.37 headroom for g26_xyzd65_display, 1.0 = 100 cd/m2 for '
+                  'ocio:lin_ciexyzd65_display')
+    return conform
 
 
 def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True):
@@ -306,9 +383,10 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         e = ET.SubElement(ns, 'Node', {'class': node.Class(), 'name': node.name()})
         for name, val in knob_values(node):
             ET.SubElement(e, 'Knob', name=name).text = val
+    conform = None
     for node in nodes:
         if is_opendrt(node):
-            describe_opendrt(nb, node, log_input, measured)
+            conform = describe_opendrt(nb, node, log_input, measured, shaper) or conform
     if embed_script:
         ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
@@ -322,6 +400,12 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
                       linSideBreak=repr(float(shaper['lb'])), linearSlope=repr(float(shaper['sl'])))
     lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
+    if conform is not None:
+        m = ET.SubElement(root, 'Matrix', inBitDepth='32f', outBitDepth='32f')
+        ET.SubElement(m, 'Description').text = 'conform output scale %r (see Info/NukeBake/Interop)' % conform
+        ET.SubElement(m, 'Array', dim='3 3').text = '\n            %r 0 0\n            0 %r 0\n            0 0 %r\n        ' % (
+            conform, conform, conform)
+        root.find('OutputDescriptor').text += ' (conformed, see Interop)'
     if hasattr(ET, 'indent'):
         ET.indent(root, '    ')
     arr.text = '\n' + '\n'.join('            ' + r for r in rows) + '\n        '
