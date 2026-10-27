@@ -169,6 +169,8 @@ print('%s restore: %d knobs compared, %d differed before, %d differ after %s'
       % ('PASS' if not bad else 'FAIL', len(knobs), len(differs), len(bad), bad))
 if bad:
     failures.append('restore')
+for n in nuke.allNodes():
+    n.setSelected(False)   # pasted/created nodes connect to the selection
 
 # --- 5. CTF -------------------------------------------------------------------
 ctf = os.path.join(OUT, 'test.ctf')
@@ -200,6 +202,36 @@ print('%s opendrt button restore: %d knobs compared, %d differ %s' % ('PASS' if 
 if bad:
     failures.append('opendrt button restore')
 assert 'clf_file' not in open(clf2).read(), 'clf_file must not be recorded'
+
+# --- 7. fit shaper to chain ---------------------------------------------------
+shaper['preset'].setValue(PRESET)
+clf_fit = os.path.join(OUT, 'test_fit.clf')
+gen['file'].setValue(clf_fit)
+gen['fit'].setValue(True)
+gen['generate'].execute()
+gen['fit'].setValue(False)
+print('status:', gen['status'].value())
+assert shaper['preset'].value() == 'XLog', shaper['preset'].value()
+hi_f, lo_f = log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0)
+print('fit domain: %.4g .. %.4g  (w0 %.4g, k %.4g)' % (lo_f, hi_f, shaper['w0'].value(), shaper['k'].value()))
+img3 = test_image(hi_f, lo_f, 'TestImageFit')
+shaper.setInput(0, img3)
+check('fit: CLF vs Nuke', max_err(apply_clf(clf_fit, sample(img3, W, H)), sample(gen, W, H)), IMAGE_TOL)
+# beyond the fitted domain the chain must already be flat, so clamping is harmless
+c = nuke.nodes.Expression(expr0=repr(hi_f * 8), expr1=repr(hi_f * 8), expr2=repr(hi_f * 8))
+c.setInput(0, None)
+shaper.setInput(0, c)
+live = [[gen.sample(ch, 0.5, 0.5) for ch in ('red', 'green', 'blue')]]
+check('fit: 3 stops above top', max_err(apply_clf(clf_fit, [[hi_f * 8] * 3]), live), 5e-3)
+# 2 stops below the floor on one channel: left half red, right half blue
+# (an image rather than single pixels: constant negative sources sample
+# black in Nuke 15.1 -t)
+c = nuke.nodes.Expression(expr0='x<width/2?%r:0.18' % (lo_f * 4), expr1='0.18',
+                          expr2='x<width/2?0.18:%r' % (lo_f * 4))
+c.setInput(0, None)
+shaper.setInput(0, c)
+check('fit: 2 stops below floor', max_err(apply_clf(clf_fit, sample(c, W, H)), sample(gen, W, H)), IMAGE_TOL)
+shaper.setInput(0, img)
 
 print('outputs in', OUT)
 if failures:

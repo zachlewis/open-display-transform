@@ -71,7 +71,7 @@ def inverse_expr(c, par):
 # ---------------------------------------------------------------------------
 # Python shared by every button. Pure stdlib + nuke.
 # ---------------------------------------------------------------------------
-COMMON = r'''import os, datetime, tempfile
+COMMON = r'''import os, math, datetime, tempfile
 import xml.etree.ElementTree as ET
 import nuke
 
@@ -235,6 +235,71 @@ if n is None:
 if not nodes:
     raise RuntimeError('Nothing between %s and %s to bake' % (n.name(), gen.name()))
 shaper_node = n
+fit_note = ''
+if bool(gen['fit'].value()):
+    # Probe the chain: seven ramps (neutral, 3 chromatic, 3 single-channel
+    # negative), find where the output stops changing, fit XLog to that.
+    sn = shaper_node
+    sn['probe'].setValue(True)
+    try:
+        W, H, NX = gen.width(), gen.height(), 128
+        xs = [(i + 0.5) * W / NX for i in range(NX)]
+
+        def row(v):
+            y = (v + 0.5) * H / 7
+            return [[gen.sample(c, x, y) for c in ('red', 'green', 'blue')] for x in xs]
+
+        def run_start(vals):
+            eps = 2e-4 * max(1.0, max(abs(c) for p in vals for c in p))
+            last, i = vals[-1], len(vals) - 1
+            while i > 0 and max(abs(a - b) for a, b in zip(vals[i - 1], last)) <= eps:
+                i -= 1
+            return i
+
+        top, floor, unsat = 0.0, 0.0, []
+        for v in range(4):
+            i = run_start(row(v))
+            if i >= NX - 1:
+                unsat.append('top')
+            top = max(top, 0.18 * 2 ** (-20 + 44 * (i + 0.5) / NX))
+        for v in range(4, 7):
+            i = run_start(row(v))
+            if i >= NX - 1:
+                unsat.append('floor')
+            floor = min(floor, -0.18 * 2 ** (-20 + 26 * (i + 0.5) / NX))
+    finally:
+        sn['probe'].setValue(False)
+    w0 = 2.0 ** 16 if 'top' in unsat else min(2.0 ** 16, max(1.0, 2.0 * top))
+    floor = -1.0 if 'floor' in unsat else 2.0 * floor
+    # XLog: w0 sets the top; solve k for the floor (lin value at code 0),
+    # keeping the linear toe's join at least 5 stops under grey.
+    o, x0, y0 = sn['o'].value(), sn['x0'].value(), sn['y0'].value()
+    o0 = -(2.0 ** -o)
+    s0 = (1.0 - y0) / math.log((w0 - o0) / (x0 - o0))
+    o1 = 1.0 - s0 * math.log(w0 - o0)
+
+    def floor_of(k):
+        return k * s0 * (1.0 - math.log(k * s0) - o1 / s0) + o0
+
+    k = sn['k'].value()
+    k_min = math.exp(-o1 / s0) / s0 * 1.01
+    k_max = (0.18 * 2.0 ** -5 - o0) / s0
+    if k_max > k_min:
+        if floor <= floor_of(k_max):
+            k = k_max
+        elif floor >= floor_of(k_min):
+            k = k_min
+        else:
+            lo_, hi_ = k_min, k_max
+            for _ in range(60):
+                mid = 0.5 * (lo_ + hi_)
+                lo_, hi_ = (mid, hi_) if floor_of(mid) > floor else (lo_, mid)
+            k = 0.5 * (lo_ + hi_)
+    sn['preset'].setValue(__XLOG__)
+    sn['w0'].setValue(w0)
+    sn['k'].setValue(k)
+    fit_note = ', fit: top %.4g -> w0 %.4g, floor %.3g -> %.3g (k %.3g)%s' % (
+        top, w0, floor, floor_of(k), k, ' [unsaturated: %s]' % ' '.join(sorted(set(unsat))) if unsat else '')
 shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'))
 shaper['preset'] = shaper_node['preset'].value()
 shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
@@ -253,8 +318,8 @@ finally:
     shaper_node['pattern'].setValue(False)
 size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input)
 os.remove(tmp)
-gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)' % (
-    os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname']))
+gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
+    os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'], fit_note))
 '''
 
 
@@ -338,8 +403,20 @@ def build_shaper():
     par = dict((k, 'parent.' + k) for k in ('logbreak', 'linoff', 'sl', 'go', 'gs', 'lo', 'ls'))
     for i, c in enumerate('rgb'):
         inv['expr%d' % i].setValue(inverse_expr(c, par))
-    sw = nuke.nodes.Switch(name='Switch1', inputs=[inp, inv])
-    sw['which'].setExpression('parent.pattern')
+    # probe ramps for "fit shaper to chain": 7 rows x 1024 columns.
+    # t: exposure ramp -20..+24 stops around 0.18; n: negative magnitude ramp.
+    nuke.addFormat('1024 7 0 0 1024 7 1 clfbake_probe')
+    con = nuke.nodes.Constant(name='ProbeFormat')
+    con['format'].setValue('clfbake_probe')
+    ramp = nuke.nodes.Expression(name='ProbeRamp', inputs=[con])
+    ramp['temp_name0'].setValue('t'); ramp['temp_expr0'].setValue('0.18*pow(2,-20+44*x/width)')
+    ramp['temp_name1'].setValue('n'); ramp['temp_expr1'].setValue('0.18*pow(2,-20+26*x/width)')
+    ramp['temp_name2'].setValue('v'); ramp['temp_expr2'].setValue('floor(y/height*7)')
+    ramp['expr0'].setValue('v==0?t:v==1?t:v==2?0.2*t:v==3?0.2*t:v==4?-n:0.18')
+    ramp['expr1'].setValue('v==0?t:v==1?0.2*t:v==2?t:v==3?0.2*t:v==5?-n:0.18')
+    ramp['expr2'].setValue('v==0?t:v==1?0.2*t:v==2?0.2*t:v==3?t:v==6?-n:0.18')
+    sw = nuke.nodes.Switch(name='Switch1', inputs=[inp, inv, ramp])
+    sw['which'].setExpression('parent.pattern?1:(parent.probe?2:0)')
     nuke.nodes.Output(name='Output1', inputs=[sw])
     g.end()
 
@@ -404,6 +481,9 @@ def build_shaper():
     k = nuke.String_Knob('clfbake_shaper', '', '1')
     k.setFlag(nuke.INVISIBLE)
     g.addKnob(k)
+    k = nuke.Boolean_Knob('probe', 'probe')
+    k.setFlag(nuke.INVISIBLE)
+    g.addKnob(k)
     g['knobChanged'].setValue(SHAPER_KNOBCHANGED)
     g['preset'].setValue(0)
     g['label'].setValue('[value preset]')
@@ -437,7 +517,14 @@ def build_generate():
                  'the way the released OpenDRT OCIO config consumes its cubes. '
                  'Default off: the shaper is embedded and the CLF takes linear input.')
     g.addKnob(k)
-    k = nuke.PyScript_Knob('generate', 'Generate', script(GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS]))))
+    k = nuke.Boolean_Knob('fit', 'fit shaper to chain')
+    k.setTooltip('Before baking, probe the chain with exposure ramps to find where its output stops '
+                 'changing, then set the shaper to XLog with w0 at the top (one stop of margin) and the '
+                 'linear toe reaching the negative floor. The fitted XLog is written to the CLF exactly, '
+                 'like any preset. Off: the preset is used as is.')
+    g.addKnob(k)
+    k = nuke.PyScript_Knob('generate', 'Generate', script(
+        GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS])).replace('__XLOG__', str(XLOG))))
     k.setFlag(nuke.STARTLINE)
     k.setTooltip('Bake the chain to a 3D LUT via GenerateLUT, then write the CLF with the shaper and node parameters embedded.')
     g.addKnob(k)

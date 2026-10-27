@@ -23,6 +23,16 @@ image -> CLFShaper -> [ OpenDRT, looks, anything ] -> CLFGenerate -> viewer
   to the selected nodes of the same class (or to the upstream chain when nothing
   is selected).
 
+Shapers are static: T-LogE covers −0.0046 to 512 linear for every input, which
+is Jed's trade-off in the released config. Tick **fit shaper to chain** on
+CLFGenerate to size the domain from the chain instead. Generate then probes it
+with exposure ramps (neutral, chromatic, and single-channel negatives), finds
+where the output stops changing, and sets the shaper to XLog with w0 one stop
+above the top and k reaching the negative floor, keeping the linear toe at
+least five stops under grey so shadow resolution is not traded away. The
+status line reports what it found. The fitted XLog is still written to the CLF
+as an exact parametric Log node.
+
 The nodes need nothing beyond Nuke's own Python: the CLF is written with
 `xml.etree`, so no PyOpenColorIO import happens at bake time.
 
