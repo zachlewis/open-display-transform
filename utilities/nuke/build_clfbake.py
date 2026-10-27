@@ -130,6 +130,24 @@ def read_cube(path):
     return n, [rows[r + n * g + n * n * b] for r in range(n) for g in range(n) for b in range(n)]
 
 
+def chain_script(nodes):
+    """The nodes as a .nk snippet (nuke.nodeCopy), so a CLF can rebuild them."""
+    full = nodes[0].fullName()
+    parent = nuke.toNode(full.rsplit('.', 1)[0]) if '.' in full else nuke.root()
+    sel = [n for n in parent.nodes() if n.isSelected()]
+    tmp = os.path.join(tempfile.gettempdir(), 'clfbake_%d.nk' % os.getpid())
+    with parent:
+        for n in parent.nodes():
+            n.setSelected(n in nodes)
+        nuke.nodeCopy(tmp)
+        for n in parent.nodes():
+            n.setSelected(n in sel)
+    txt = open(tmp).read()
+    os.remove(tmp)
+    # the bake path is not part of the node's recipe
+    return '\n'.join(l for l in txt.splitlines() if not l.strip().startswith('clf_file ')) + '\n'
+
+
 def write_clf(path, cube, shaper, nodes, interpolation, log_input):
     """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k)."""
     n, rows = read_cube(cube)
@@ -152,6 +170,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input):
         e = ET.SubElement(ns, 'Node', {'class': node.Class(), 'name': node.name()})
         for name, val in knob_values(node):
             ET.SubElement(e, 'Knob', name=name).text = val
+    ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
                   date=datetime.datetime.now().isoformat(timespec='seconds'),
                   script=nuke.root().name())
@@ -339,6 +358,47 @@ size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_inp
 os.remove(tmp)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
     os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'], fit_note))
+'''
+
+
+FROM_CLF = COMMON + r'''
+gen = nuke.thisNode()
+parent = nuke.thisParent()
+nb = read_bake(gen['file'].evaluate())
+sc = nb.find('Script')
+if sc is None or not (sc.text or '').strip():
+    raise RuntimeError('this CLF carries no node script (older bake); use Restore')
+shaper, n = None, gen.input(0)
+while n is not None:
+    if MARK in n.knobs():
+        shaper = n
+        break
+    n = n.input(0)
+if shaper is None:
+    raise RuntimeError('connect a CLFShaper upstream of %s first; From CLF rebuilds the nodes between them' % gen.name())
+tmp = os.path.join(tempfile.gettempdir(), 'clfbake_from_%d.nk' % os.getpid())
+open(tmp, 'w').write(sc.text)
+with parent:
+    for t in parent.nodes():
+        t.setSelected(False)
+    nuke.nodePaste(tmp)
+    new = [t for t in parent.nodes() if t.isSelected()]
+    for t in new:
+        t.setSelected(False)
+os.remove(tmp)
+if not new:
+    raise RuntimeError('nothing pasted from the CLF script')
+heads = [t for t in new if t.input(0) not in new]
+tails = [t for t in new if not any(d in new for d in t.dependent())]
+heads[0].setInput(0, shaper)
+gen.setInput(0, tails[0])
+for i, t in enumerate(new):
+    t.setXYpos(gen.xpos(), gen.ypos() - 60 * (len(new) - i))
+done, sh = restore_apply(nb, [shaper])
+gen['domain'].setValue('preset')
+if sh is not None:
+    gen['log_input'].setValue(sh.get('embedded') == 'false')
+gen['status'].setValue('from CLF: %s -> %s -> %s' % (shaper.name(), ' -> '.join(t.name() for t in new), gen.name()))
 '''
 
 
@@ -551,6 +611,10 @@ def build_generate():
     g.addKnob(k)
     k = nuke.PyScript_Knob('restore', 'Restore', script(RESTORE))
     k.setTooltip('Read the CLF and apply the recorded parameters to the selected nodes (or to the upstream chain if nothing is selected).')
+    g.addKnob(k)
+    k = nuke.PyScript_Knob('from_clf', 'From CLF', script(FROM_CLF))
+    k.setTooltip('Rebuild the nodes that made this CLF from the script it carries, wire them between the '
+                 'upstream CLFShaper and this node, and restore the shaper. Baking again reproduces the CLF.')
     g.addKnob(k)
     g.addKnob(nuke.Text_Knob('status', ' ', ''))
     g['tile_color'].setValue(0x4a3a7aff)

@@ -11,7 +11,11 @@ then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
   3. a log-input CLF applied to log-encoded values matches too,
   4. Restore applies the recorded OpenDRT parameters to a fresh node,
   5. the same bake written as CTF loads,
-  6. the thin Bake CLF / Restore CLF buttons on OpenDRT itself do the same.
+  6. the thin Bake CLF / Restore CLF buttons on OpenDRT itself do the same,
+  7. domain auto keeps a sufficient preset, fit replaces it and clamps exactly,
+  8. From CLF rebuilds the chain from the script the CLF carries, and baking
+     that rebuilt chain reproduces the original CLF's Log parameters and LUT
+     array byte for byte, for both the standalone and the OpenDRT-button CLF.
 PyOpenColorIO is used here only as the independent reader; the nodes write
 the CLF with xml.etree. Exits non-zero on failure.
 """
@@ -62,6 +66,16 @@ def sample(node, w, h):
 
 def max_err(a, b):
     return max(abs(p - q) for pa, pb in zip(a, b) for p, q in zip(pa, pb))
+
+
+def clf_core(path):
+    """(LogParams attributes or None, LUT3D array rows, recorded knob values) for byte comparison."""
+    import xml.etree.ElementTree as ET
+    root = ET.parse(path).getroot()
+    lp = root.find('Log/LogParams')
+    rows = [l.split() for l in root.find('LUT3D/Array').text.strip().splitlines()]
+    knobs = dict((k.get('name'), k.text) for k in root.iter('Knob'))
+    return (dict(lp.attrib) if lp is not None else None), rows, knobs
 
 
 def apply_clf(path, pixels):
@@ -164,9 +178,10 @@ for n in nuke.allNodes():
     n.setSelected(n is fresh)
 gen['restore'].execute()
 print('status:', gen['status'].value())
-bad = [k for k in knobs if drt[k].toScript() != fresh[k].toScript()]
-print('%s restore: %d knobs compared, %d differed before, %d differ after %s'
-      % ('PASS' if not bad else 'FAIL', len(knobs), len(differs), len(bad), bad))
+recorded = list(clf_core(clf)[2])
+bad = [k for k in recorded if drt[k].toScript() != fresh[k].toScript()]
+print('%s restore: %d recorded knobs compared, %d differed before, %d differ after %s'
+      % ('PASS' if not bad else 'FAIL', len(recorded), len(differs), len(bad), bad))
 if bad:
     failures.append('restore')
 for n in nuke.allNodes():
@@ -201,7 +216,8 @@ bad = [k for k in knobs if d2[k].toScript() != d3[k].toScript()]
 print('%s opendrt button restore: %d knobs compared, %d differ %s' % ('PASS' if not bad else 'FAIL', len(knobs), len(bad), bad))
 if bad:
     failures.append('opendrt button restore')
-assert 'clf_file' not in open(clf2).read(), 'clf_file must not be recorded'
+txt2 = open(clf2).read()
+assert clf2 not in txt2 and '<Knob name="clf_file">' not in txt2, 'the bake path must not be recorded'
 
 # --- 7. domain: auto keeps a sufficient preset, fit replaces it ---------------
 shaper['preset'].setValue(len(shaper['preset'].values()) - 1)   # XLog
@@ -243,6 +259,34 @@ c.setInput(0, None)
 shaper.setInput(0, c)
 check('fit: 2 stops below floor', max_err(apply_clf(clf_fit, sample(c, W, H)), sample(gen, W, H)), IMAGE_TOL)
 shaper.setInput(0, img)
+
+# --- 8. From CLF rebuilds the chain; re-baking reproduces the CLF ---------------
+def rebake_matches(name, src_clf):
+    for n in nuke.allNodes():
+        n.setSelected(False)
+    s2, g2 = paste(CLFBAKE)
+    if 'clfbake_shaper' not in s2.knobs():
+        s2, g2 = g2, s2
+    s2.setInput(0, img)
+    g2.setInput(0, s2)
+    g2['file'].setValue(src_clf)
+    g2['from_clf'].execute()
+    print('status:', g2['status'].value())
+    mid = g2.input(0)
+    assert mid is not None and mid is not s2 and mid.input(0) is s2, 'From CLF did not wire the chain'
+    out = os.path.join(OUT, 'rebake_%s.clf' % name.replace(' ', '_'))
+    g2['file'].setValue(out)
+    g2['generate'].execute()
+    a, b = clf_core(src_clf), clf_core(out)
+    same = a[0] == b[0] and a[1] == b[1] and a[2] == b[2]
+    print('%s rebake from CLF (%s): LogParams %s, %d array rows %s, %d knobs %s'
+          % ('PASS' if same else 'FAIL', name, 'same' if a[0] == b[0] else 'DIFFER',
+             len(a[1]), 'identical' if a[1] == b[1] else 'DIFFER', len(a[2]), 'same' if a[2] == b[2] else 'DIFFER'))
+    if not same:
+        failures.append('rebake ' + name)
+
+rebake_matches('standalone', clf)          # T-LogE 48^3, the first bake of this run
+rebake_matches('opendrt button', clf2)     # the OpenDRT button's own bake
 
 print('outputs in', OUT)
 if failures:

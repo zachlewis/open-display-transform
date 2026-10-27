@@ -22,6 +22,10 @@ image -> CLFShaper -> [ OpenDRT, looks, anything ] -> CLFGenerate -> viewer
 - **Restore** reads a CLF written this way and applies the recorded knob values
   to the selected nodes of the same class (or to the upstream chain when nothing
   is selected).
+- **From CLF** rebuilds the nodes that made the CLF from the node script it
+  carries, wires them between the upstream CLFShaper and CLFGenerate, and
+  restores the shaper. Baking again reproduces the original CLF exactly, which
+  is what the test harness checks.
 
 Shapers are static: T-LogE covers −0.0046 to 512 linear for every input, which
 is Jed's trade-off in the released config, and the default **domain** setting
@@ -63,7 +67,8 @@ Metadata lives in the CLF `<Info>` element:
       ...
     </Node>
   </Nodes>
-  <Generator nuke="16.0v4" ocio="2.3.1" date="..." script="..."/>
+  <Script>...the baked nodes as a .nk snippet, for From CLF...</Script>
+  <Generator nuke="16.0v4" date="..." script="..."/>
 </NukeBake>
 ```
 
