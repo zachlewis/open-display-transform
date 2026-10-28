@@ -505,14 +505,56 @@ i = txt.index('END METADATA') + 2
 n_pre = int(txt[i]); pre_in = [float(v) for v in txt[i + 1].split()]; pre_out = [float(v) for v in txt[i + 2].split()]
 pre_err = max(abs(lcpu.applyRGB([x, x, x])[0] - y) for x, y in zip(pre_in, pre_out))
 check('csp: prelut points on the Log node', pre_err, 1e-5)
-size_line = next(k for k, l in enumerate(txt) if l == '48 48 48')
-csp_rows = [tuple(l.split()) for l in txt[size_line + 1:size_line + 1 + 48 ** 3]]
+size_line = next(k for k, l in enumerate(txt) if l.split() == ['48', '48', '48'])
+csp_rows = [[float(v) for v in l.split()] for l in txt[size_line + 1:size_line + 1 + 48 ** 3]]
 N = 48
 csp_bf = [csp_rows[r + N * g + N * N * b] for r in range(N) for g in range(N) for b in range(N)]
-same = csp_bf == [tuple(r) for r in clf_core(auto_path)[1]]
-print('%s csp: cube rows identical to the CLF (%d rows, n_prelut %d)' % ('PASS' if same and n_pre == 4096 else 'FAIL', len(csp_rows), n_pre))
-if not (same and n_pre == 4096):
+cube_err = max(abs(a - b) for ra, rb in zip(csp_bf, clf_core(auto_path)[1]) for a, b in zip(ra, [float(v) for v in rb]))
+check('csp: cube vs CLF lattice (Baker)', cube_err, 1e-5)
+print('%s csp: %d cube rows, prelut %d points' % ('PASS' if len(csp_rows) == N ** 3 and n_pre == 4096 else 'FAIL', len(csp_rows), n_pre))
+if not (len(csp_rows) == N ** 3 and n_pre == 4096):
     failures.append('csp cube rows')
+
+# --- 12. log input with a code range beyond [0, 1] ----------------------------------
+shaper['preset'].setValue(0)
+shaper['code_min'].setValue(0.0)
+shaper['code_max'].setValue(1.0)
+gen['log_input'].setValue(True)
+gen['domain'].setValue('fit')
+gen['format'].setValue('clf')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+clf_rng = gen['file'].value()
+print('status:', gen['status'].value())
+gen['domain'].setValue('preset')
+cmax, cmin = shaper['code_max'].value(), shaper['code_min'].value()
+root_r = ET.parse(clf_rng).getroot()
+rng = root_r.find('Range')
+in_id_r = root_r.find('Info/CLFBake/Interop').get('input')
+ok_rng = cmax > 1.0 and rng is not None and abs(float(rng.find('maxInValue').text) - cmax) < 1e-9 \
+    and root_r.find('Log') is None and '|codes' in in_id_r and '-codes' in os.path.basename(clf_rng)
+print('%s log input code range: code_max %.3f, Range node %s, input %s\n   %s' % (
+    'PASS' if ok_rng else 'FAIL', cmax, 'present' if rng is not None else 'MISSING', in_id_r, os.path.basename(clf_rng)))
+if not ok_rng:
+    failures.append('log input code range')
+# apply to log-encoded pixels of an image that reaches above code 1.0
+img_r = test_image(log_to_lin(shaper, cmax), log_to_lin(shaper, cmin), 'TestImageRange')
+shaper.setInput(0, img_r)
+lin_r = sample(img_r, W, H)
+logpix = [[lin_to_log(shaper, c) for c in p] for p in lin_r]
+assert max(max(p) for p in logpix) > 1.0, 'range image must exceed code 1.0'
+check('log input range: CLF vs Nuke', max_err(apply_clf(clf_rng, logpix), sample(gen, W, H)), IMAGE_TOL)
+# the same bake as csp: Baker with Range + no Log in the shaper
+gen['format'].setValue('csp')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+csp_r = gen['file'].value()
+gen['format'].setValue('clf')
+check('log input range csp: vs Nuke', max_err(apply_clf(csp_r, logpix), sample(gen, W, H)), IMAGE_TOL)
+gen['log_input'].setValue(False)
+shaper['code_min'].setValue(0.0)
+shaper['code_max'].setValue(1.0)
+shaper.setInput(0, img)
 
 print('outputs in', OUT)
 if failures:

@@ -60,12 +60,15 @@ def table_expr(col, xlog_expr):
     return expr
 
 
-# inverse shaper (log code value -> linear), the same formula for all presets
+# inverse shaper (log code value -> linear), the same formula for all presets.
+# The lattice value v maps to code = code_min + v*(code_max - code_min) first,
+# so a bake can cover a code range other than [0, 1] (log input beyond 1.0).
 INVERSE = '%(c)s<=%(logbreak)s?(%(c)s-%(linoff)s)/%(sl)s:(pow(2,(%(c)s-%(go)s)/%(gs)s)-%(lo)s)/%(ls)s'
 
 
-def inverse_expr(c, par):
-    return INVERSE % dict(par, c=c)
+def inverse_expr(c, par, cmin='0', cmax='1'):
+    code = c if (cmin, cmax) == ('0', '1') else '(%s+%s*(%s-%s))' % (cmin, c, cmax, cmin)
+    return INVERSE % dict(par, c=code)
 
 
 # ---------------------------------------------------------------------------
@@ -130,37 +133,70 @@ def read_cube(path):
     return n, [rows[r + n * g + n * n * b] for r in range(n) for g in range(n) for b in range(n)], rows
 
 
-def shaper_inverse(sh, code):
-    """log code value -> linear, for a shaper dict (gs go ls lo lb sl)."""
-    logbreak = sh['gs'] * math.log(sh['ls'] * sh['lb'] + sh['lo'], 2) + sh['go']
-    if code <= logbreak:
-        return (code - (logbreak - sh['sl'] * sh['lb'])) / sh['sl']
-    return (2.0 ** ((code - sh['go']) / sh['gs']) - sh['lo']) / sh['ls']
-
-
 CSP_PRELUT = 4096
 
 
-def write_csp(path, n, rows_red_fastest, shaper, log_input, conform, meta_lines):
-    """Cinespace .csp: 1D prelut per channel (the shaper, 4096 log-spaced
-    samples) followed by the 3D cube. Everything else stays in the metadata."""
-    if log_input:
-        pre_in, pre_out = ['0', '1'], ['0', '1']
-    else:
-        codes = [j / float(CSP_PRELUT - 1) for j in range(CSP_PRELUT)]
-        pre_in = ['%.9g' % shaper_inverse(shaper, c) for c in codes]
-        pre_out = ['%.9g' % c for c in codes]
-    out = ['CSPLUTV100', '3D', '', 'BEGIN METADATA']
-    out += [l for l in meta_lines if l.strip()]
-    out += ['END METADATA', '']
-    for _ in range(3):
-        out += [str(len(pre_in)), ' '.join(pre_in), ' '.join(pre_out), '']
-    out.append('%d %d %d' % (n, n, n))
-    if conform is None:
-        out += rows_red_fastest
-    else:
-        out += [' '.join('%.9g' % (float(v) * conform) for v in r.split()) for r in rows_red_fastest]
-    open(path, 'w').write('\n'.join(out) + '\n')
+def bake_csp(path, clf_path, n, shaper, log_input, meta_lines):
+    """Cinespace .csp through OpenColorIO's Baker, from the CLF: an in-memory
+    config with a 'reference' colorspace (no transforms), a 'baked' colorspace
+    that applies the CLF from_scene_reference, and a 'shaper' NamedTransform
+    (lin -> log, forward) used as the Baker's shaper space at 4096 points. The
+    Baker samples the shaper's inverse at uniform codes for the prelut and
+    evaluates the CLF at the lattice, so the cube reproduces the CLF's exactly."""
+    import PyOpenColorIO as ocio
+    ocio.ClearAllCaches()
+    cfg = ocio.Config()
+    cfg.setMajorVersion(2)
+    cfg.setMinorVersion(1)
+    ref = ocio.ColorSpace()
+    ref.setName('reference')
+    cfg.addColorSpace(ref)
+    baked = ocio.ColorSpace()
+    baked.setName('baked')
+    baked.setTransform(ocio.FileTransform(src=clf_path), ocio.COLORSPACE_DIR_FROM_REFERENCE)
+    cfg.addColorSpace(baked)
+    cfg.setRole('scene_linear', 'reference')
+    cfg.setRole('default', 'reference')
+    c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
+    ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
+    use_shaper = (not log_input) or ranged
+    if use_shaper:
+        # With a NamedTransform as shaper space, the Baker applies its FORWARD
+        # transform as shaper -> input (measured, OCIO 2.2 and 2.3), so the
+        # forward chain is: lattice [0,1] -> code range -> (log -> linear).
+        grp = ocio.GroupTransform()
+        if ranged:
+            grp.appendTransform(ocio.RangeTransform(minInValue=0.0, maxInValue=1.0, minOutValue=c0, maxOutValue=c1))
+        if not log_input:
+            grp.appendTransform(ocio.LogCameraTransform(
+                base=2.0, linSideBreak=[float(shaper['lb'])] * 3,
+                logSideSlope=[float(shaper['gs'])] * 3, logSideOffset=[float(shaper['go'])] * 3,
+                linSideSlope=[float(shaper['ls'])] * 3, linSideOffset=[float(shaper['lo'])] * 3,
+                linearSlope=[float(shaper['sl'])] * 3, direction=ocio.TRANSFORM_DIR_INVERSE))
+        nt = ocio.NamedTransform()
+        nt.setName('shaper')
+        nt.setTransform(grp, ocio.TRANSFORM_DIR_FORWARD)
+        cfg.addNamedTransform(nt)
+    baker = ocio.Baker()
+    baker.setConfig(cfg)
+    baker.setFormat('cinespace')
+    baker.setInputSpace('reference')
+    baker.setTargetSpace('baked')
+    baker.setCubeSize(n)
+    if use_shaper:
+        baker.setShaperSpace('shaper')
+        baker.setShaperSize(CSP_PRELUT)
+    md = baker.getFormatMetadata()
+    for line in meta_lines:
+        if line.strip():
+            md.addChildElement(ocio.METADATA_DESCRIPTION, line)
+    baker.bake(path)
+    # make sure the metadata block carries our lines whatever the writer did with Description
+    txt = open(path).read().splitlines()
+    if 'BEGIN METADATA' in txt and not any(l.startswith('id ') for l in txt):
+        i = txt.index('BEGIN METADATA') + 1
+        txt[i:i] = [l for l in meta_lines if l.strip()]
+        open(path, 'w').write('\n'.join(txt) + '\n')
 
 
 def chain_script(nodes):
@@ -504,6 +540,11 @@ def interop_ids(node, ns, log_input, shaper, measured):
     else:
         base = 'lin_%s_scene' % g
         in_id, in_fb = (base, None) if base in PUBLISHED_IN else ('%s:%s' % (ns, base), None)
+    c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
+    if abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9:   # the lattice spans codes [c0, c1] of that encoding
+        base = in_id.split(':')[-1]
+        in_fb = in_fb or (base if base in PUBLISHED_IN or in_id.startswith('ocio:') else None)
+        in_id = '%s:%s|codes%gto%g' % (ns, base, c0, c1)
     base = '%s_%s_display' % (EOTF_SHORT[eotf], CONTAINER_SHORT[cont])
     base = OUT_ALIAS.get(base, base)
     conform = PUBLISHED_OUT.get(base)
@@ -623,7 +664,8 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     ET.SubElement(root, 'OutputDescriptor').text = tail.name()
     nb = ET.SubElement(ET.SubElement(root, 'Info'), 'CLFBake', version='2')
     sh = ET.SubElement(nb, 'Shaper')
-    for k in ('preset', 'shortname', 'cube_size', 'gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'):
+    for k in ('preset', 'shortname', 'cube_size', 'code_min', 'code_max', 'gs', 'go', 'ls', 'lo', 'lb', 'sl',
+              'w0', 'o', 'x0', 'y0', 'k'):
         if k in shaper:
             sh.set(k, str(shaper[k]))
     sh.set('embedded', 'false' if log_input else 'true')
@@ -648,25 +690,19 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         root.set('version', '2')
     else:
         root.set('compCLFversion', '3')
-    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}}' % (
-        pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1)
+    c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
+    ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
+    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}%s}' % (
+        pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1,
+        'codes{%r,%r}' % (c0, c1) if ranged else '')
     pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
     root.set('id', pid)
-    if ext == '.csp':
-        inter = nb.find('Interop')
-        meta = ['id %s' % pid, 'input %s' % root.find('InputDescriptor').text,
-                'output %s' % root.find('OutputDescriptor').text,
-                'shaper %s %s (%d-point prelut)' % (shaper['preset'], shaper['shortname'], CSP_PRELUT)]
-        if inter is not None:
-            meta += ['interop_input %s' % inter.get('input', ''), 'interop_output %s' % inter.get('output', '')]
-            if inter.get('outputConform'):
-                meta.append('output_conform %s (baked into the cube)' % inter.get('outputConform'))
-        if desc:
-            mast = nb.find('Mastering')
-            meta.append('viewing_condition %s' % mast.find('ViewingEnvironment').get('condition'))
-            meta.append('peak_luminance %s' % mast.find('DisplayColorVolume').get('maxLuminance'))
-        write_csp(path, n, rows_rf, shaper, log_input, conform, meta)
-        return n, path.replace(os.sep, '/'), pid
+    csp_path = None
+    if ext == '.csp':   # the CLF is still written, to a temporary file, and the csp is baked from it
+        # unique name: OCIO caches FileTransforms by path, a reused name would bake the previous CLF
+        csp_path, path = path, os.path.join(tempfile.gettempdir(), 'clfbake_%s.clf' % uuid.uuid4().hex)
+        root.set('compCLFversion', '3')
+        root.attrib.pop('version', None)
     if embed_script:
         ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
@@ -678,6 +714,11 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
                       linSideSlope=repr(float(shaper['ls'])), linSideOffset=repr(float(shaper['lo'])),
                       logSideSlope=repr(float(shaper['gs'])), logSideOffset=repr(float(shaper['go'])),
                       linSideBreak=repr(float(shaper['lb'])), linearSlope=repr(float(shaper['sl'])))
+    if ranged:   # lattice spans shaper codes [c0, c1]: exact remap to the LUT3D's [0, 1]
+        rng = ET.SubElement(root, 'Range', inBitDepth='32f', outBitDepth='32f')
+        ET.SubElement(rng, 'Description').text = 'shaper code range [%r, %r] -> LUT3D domain' % (c0, c1)
+        for tag, val in (('minInValue', c0), ('maxInValue', c1), ('minOutValue', 0.0), ('maxOutValue', 1.0)):
+            ET.SubElement(rng, tag).text = repr(val)
     lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
     if conform is not None:
@@ -690,6 +731,24 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         ET.indent(root, '    ')
     arr.text = '\n' + '\n'.join('            ' + r for r in rows) + '\n        '
     ET.ElementTree(root).write(path, encoding='UTF-8', xml_declaration=True)
+    if csp_path:
+        inter = nb.find('Interop')
+        meta = ['id %s' % pid, 'input %s' % root.find('InputDescriptor').text,
+                'output %s' % root.find('OutputDescriptor').text,
+                'shaper %s %s (%d-point prelut)' % (shaper['preset'], shaper['shortname'], CSP_PRELUT)]
+        if inter is not None:
+            meta += ['interop_input %s' % inter.get('input', ''), 'interop_output %s' % inter.get('output', '')]
+            if inter.get('outputConform'):
+                meta.append('output_conform %s (baked into the cube)' % inter.get('outputConform'))
+        if desc:
+            mast = nb.find('Mastering')
+            meta.append('viewing_condition %s' % mast.find('ViewingEnvironment').get('condition'))
+            meta.append('peak_luminance %s' % mast.find('DisplayColorVolume').get('maxLuminance'))
+        try:
+            bake_csp(csp_path, path, n, shaper, log_input, meta)
+        finally:
+            os.remove(path)
+        path = csp_path
     return n, path.replace(os.sep, '/'), pid
 
 
@@ -721,6 +780,9 @@ def restore_apply(nb, targets):
                 if sh.get(k) is not None:
                     t[k].setValue(float(sh.get(k)))
             t['cube_size'].setValue(int(sh.get('cube_size', 48)))
+            for k in ('code_min', 'code_max'):
+                if sh.get(k) is not None and k in t.knobs():
+                    t[k].setValue(float(sh.get(k)))
             done.append(t.name())
             targets.remove(t)
             break
@@ -759,6 +821,7 @@ if not nodes:
     raise RuntimeError('Nothing between %s and %s to bake' % (n.name(), gen.name()))
 shaper_node = n
 fit_note = ''
+log_input = bool(gen['log_input'].value())
 mode = gen['domain'].value()
 if mode != 'preset':
     # Probe the chain: seven ramps (neutral, 3 chromatic, 3 single-channel
@@ -798,19 +861,42 @@ if mode != 'preset':
         top = 2.0 ** 15
     if 'floor' in unsat:
         floor = -0.5
-    # what the current preset already covers (lin at code 1 and code 0)
+    # what the current shaper already covers (linear at code_max and code_min)
     gs, go, ls, lo, lb, sl = [sn[k].value() for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl')]
     logbreak = gs * math.log(ls * lb + lo, 2) + go
-    have_top = (2.0 ** ((1.0 - go) / gs) - lo) / ls
-    have_floor = (0.0 - (logbreak - sl * lb)) / sl if 0.0 <= logbreak else (2.0 ** ((0.0 - go) / gs) - lo) / ls
+
+    def to_lin(code):
+        return (code - (logbreak - sl * lb)) / sl if code <= logbreak else (2.0 ** ((code - go) / gs) - lo) / ls
+
+    def to_code(lin):
+        return sl * lin + (logbreak - sl * lb) if lin < lb else gs * math.log(ls * lin + lo, 2) + go
+
+    have_top, have_floor = to_lin(sn['code_max'].value()), to_lin(sn['code_min'].value())
     # an unbounded floor (DRTs keep desaturating negatives forever) is not a
     # reason to fit: the shadow guard caps what a fit could give anyway
     need = top > have_top or ('floor' not in unsat and floor < have_floor)
-    mode = 'fit' if mode == 'fit' or need else 'keep'
-    if mode == 'keep':
-        fit_note = ', auto: %s covers it (top %.4g <= %.4g, floor %.3g >= %.3g)' % (
-            sn['preset'].value(), top, have_top, floor, have_floor)
+    if log_input:
+        # the input encoding is fixed, so instead of refitting the curve the
+        # lattice spans a code range: top with one stop of margin, never below
+        # the encoding's own 1.0, capped at 1.5; floor only when bounded
+        c1 = max(1.0, min(1.5, to_code(2.0 * top)))
+        c0 = min(0.0, max(-0.1, to_code(2.0 * floor))) if 'floor' not in unsat else 0.0
+        if mode == 'fit' or need:
+            sn['code_min'].setValue(c0)
+            sn['code_max'].setValue(c1)
+            fit_note = ', fit: log input codes [%g, %g] (top %.4g -> code %.3g)' % (c0, c1, top, to_code(top))
+        else:
+            fit_note = ', auto: %s codes [%g, %g] cover it (top %.4g <= %.4g)' % (
+                sn['preset'].value(), sn['code_min'].value(), sn['code_max'].value(), top, have_top)
+        mode = 'keep'
+    else:
+        mode = 'fit' if mode == 'fit' or need else 'keep'
+        if mode == 'keep':
+            fit_note = ', auto: %s covers it (top %.4g <= %.4g, floor %.3g >= %.3g)' % (
+                sn['preset'].value(), top, have_top, floor, have_floor)
 if mode == 'fit':
+    sn['code_min'].setValue(0.0)   # the fitted XLog carries the range itself
+    sn['code_max'].setValue(1.0)
     w0 = min(2.0 ** 16, max(1.0, 2.0 * top))
     floor = 2.0 * floor
     # XLog: w0 sets the top; solve k for the floor (lin value at code 0),
@@ -842,7 +928,8 @@ if mode == 'fit':
     sn['k'].setValue(k)
     fit_note = ', fit: top %.4g -> w0 %.4g, floor %.3g -> %.3g (k %.3g)%s' % (
         top, w0, floor / 2.0, floor_of(k), k, ' [unsaturated: %s]' % ' '.join(sorted(set(unsat))) if unsat else '')
-shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'))
+shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k',
+                                                    'code_min', 'code_max'))
 shaper['preset'] = shaper_node['preset'].value()
 shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
 shaper['cube_size'] = int(shaper_node['cube_size'].value())
@@ -935,7 +1022,7 @@ gen['status'].setValue('restored: %s' % (', '.join(done) or 'nothing matched (se
 
 # Thin buttons for OpenDRT.nk: fixed T-LogE shaper at 48^3, tetrahedral, embedded.
 OPENDRT_SHAPER = dict(preset_params(0), preset=PRESETS[0][0], shortname=PRESETS[0][1], cube_size=48,
-                      **dict(XLOG_DEFAULTS))
+                      code_min=0.0, code_max=1.0, **dict(XLOG_DEFAULTS))
 OPENDRT_SHAPER['logbreak'] = (OPENDRT_SHAPER['gs'] * math.log(OPENDRT_SHAPER['ls'] * OPENDRT_SHAPER['lb']
                               + OPENDRT_SHAPER['lo'], 2) + OPENDRT_SHAPER['go'])
 OPENDRT_SHAPER['linoff'] = OPENDRT_SHAPER['logbreak'] - OPENDRT_SHAPER['sl'] * OPENDRT_SHAPER['lb']
@@ -1013,7 +1100,7 @@ def build_shaper():
     inv = nuke.nodes.Expression(name='InverseShaper', inputs=[pat])
     par = dict((k, 'parent.' + k) for k in ('logbreak', 'linoff', 'sl', 'go', 'gs', 'lo', 'ls'))
     for i, c in enumerate('rgb'):
-        inv['expr%d' % i].setValue(inverse_expr(c, par))
+        inv['expr%d' % i].setValue(inverse_expr(c, par, 'parent.code_min', 'parent.code_max'))
     # probe ramps: 8 rows x 1024 columns. Rows 0-3 exposure ramps (-20..+24
     # stops around 0.18; neutral, then chromatic), rows 4-6 single-channel
     # negative ramps, row 7 neutral 0.18 (left) and 1.0 (right) for luminance.
@@ -1054,6 +1141,17 @@ def build_shaper():
     k.setValue(48)
     k.setTooltip('3D LUT lattice size. 48 matches the released OpenDRT OCIO config. CLF allows up to 128.')
     g.addKnob(k)
+    for name, label, val in (('code_min', 'code range', 0.0), ('code_max', '', 1.0)):
+        d = nuke.Double_Knob(name, label)
+        d.setRange(-0.5, 2.0)
+        d.setValue(val)
+        d.setTooltip('Shaper code values the lattice spans. [0, 1] is the encoding\'s own range; a log input bake '
+                     'in a float pipeline may carry codes above 1.0 (S-Log3 code 1.0 is only 38 linear), so the '
+                     'top can be raised. Written to the CLF as an exact Range node. CLFGenerate\'s auto/fit sets '
+                     'it for log input bakes from what the chain still responds to.')
+        if name == 'code_max':
+            d.clearFlag(nuke.STARTLINE)
+        g.addKnob(d)
     k = nuke.Boolean_Knob('pattern', 'show pattern')
     k.setFlag(nuke.STARTLINE)
     k.setTooltip('Output the shaped CMSTestPattern instead of the input. CLFGenerate toggles this while baking.')

@@ -57,19 +57,47 @@ the CLF exactly, like any preset. Measured on OpenDRT with inputs up to 8192
 linear, T-LogE clamps at 3.0e-2 worst case regardless of size; the fitted XLog
 reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 
-**Cinespace output.** `csp` writes the same bake as a Cinespace LUT for hosts
-without CLF: the shaper becomes a per-channel 1D prelut of 4096 points whose
-inputs are the inverse shaper of 4096 uniform codes (so the points sit exactly
-on the parametric curve, log-spaced in linear), followed by the 3D cube in
-red-fastest order; a conforming output scale is baked into the cube; the id,
+**Cinespace output.** `csp` is derived from the CLF, never baked separately:
+the CLF is written (to a temporary file when only the csp is wanted), then an
+in-memory OCIO config is built with a `reference` colorspace that has no
+transforms, a `baked` colorspace that applies the CLF `from_scene_reference`,
+and a `shaper` NamedTransform holding the same LogCameraTransform in the
+lin-to-log direction, and OCIO's `Baker` writes `cinespace` with
+`setShaperSpace('shaper')`, `setShaperSize(4096)` and the CLF's cube size.
+The Baker samples the shaper's inverse at 4096 uniform codes for the prelut, so
+its points sit exactly on the parametric curve, and evaluates the CLF at the
+lattice, so the cube equals the CLF's (a conforming scale included). The id,
 interop IDs, viewing condition and peak luminance go in the metadata block.
-With `log input` the prelut is the identity. One caveat for OpenColorIO as a
-consumer: its `.csp` reader resamples the prelut into a uniform 65,536-entry
+With `log input` there is no shaper. This is the one place the nodes import
+PyOpenColorIO, which Nuke bundles. One caveat for OpenColorIO as a consumer: its `.csp` reader resamples the prelut into a uniform 65,536-entry
 1D LUT across the prelut's input range, which for a 512-linear top means one
 sample per 0.0078 linear and a visible loss in the shadows (measured 3e-3 at
 −5 stops, 1e-2 worst case on the harness image). Hosts that interpolate the
 prelut on its given points reproduce the shaper to about 1e-7. Give OCIO the
 CLF.
+
+**Code range for log input.** A log encoding's own range, codes 0 to 1, tops
+out low in linear for some encodings: S-Log3 at 38, LogC3 at 55, ACEScct at
+223, LogC4 at 470, T-LogE at 512. A float pipeline carrying those encodings
+can hold highlights above code 1.0, and a 1000-nit OpenDRT is still rendering
+them. In `log input` mode the encoding is the contract, so instead of swapping
+the shaper the lattice spans a code range `[code min, code max]` on
+CLFShaper, written to the CLF as an exact `Range` node ahead of the LUT3D and
+to the Baker's shaper for csp. `auto` and `fit` set it from the probe: the top
+with one stop of margin, never below 1.0 so the encoding's own range is always
+covered, capped at 1.5; the floor only when the probe found it bounded. The
+input interop ID gains `|codes0to1.19`-style modifier and the file name shows
+it. The cost is a proportionally coarser lattice, 19% for a 1.19 top.
+
+Why not an OCIO `AllocationTransform` as the csp shaper: it would bake, but a
+lg2 allocation is a different curve from T-LogE, so the Baker would resample
+the CLF's lattice through tetrahedral interpolation rather than landing on it.
+The NamedTransform carries the exact shaper, and the cube stays equal to the
+CLF's. One measured fact about that NamedTransform: with a NamedTransform as
+the Baker's shaper space, OCIO 2.2 and 2.3 apply its *forward* transform as
+shaper-to-input, so the forward transform must be the decode direction
+(codes to linear). Some references state the opposite; the harness checks
+the prelut points against the CLF's Log node, which settles it.
 
 **Automatic file names.** When `file` is a directory (or empty), the name is
 explicit and deterministic, never random:
@@ -298,7 +326,8 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | fit: CLF vs Nuke, above top, below floor | A fitted XLog matches within interpolation error, clamping beyond the fitted top costs nothing, and the floor is within tolerance. | 3e-2 / 5e-3 / 3e-2 |
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
 | auto file names, parameter string, opendrt button auto name | A modified node names by hash, an untouched one by look preset, a tonescale-only change by tonescale name plus hash, and the hash survives a peak-luminance change; the CLF id parses and, applied to a fresh node through Apply Params, reproduces every recorded knob; the OpenDRT button names and hashes identically. | exact |
-| csp: structure, vs Nuke, prelut points on the Log node, cube rows identical | A `.csp` bake has the header, three 4096-point preluts and the id in its metadata; evaluates against Nuke within tolerance through OCIO's reader; every prelut point lies on the CLF's Log node to 1e-5; the cube rows equal the CLF's after reordering. | 3e-2 / 1e-5 / exact |
+| csp: structure, vs Nuke, prelut points on the Log node, cube vs CLF lattice | A `.csp` bake has the header, three 4096-point preluts and the id in its metadata; evaluates against Nuke within tolerance through OCIO's reader; every prelut point lies on the CLF's Log node to 1e-5; the Baker's cube equals the CLF's lattice to 1e-5 after reordering. | 3e-2 / 1e-5 / 1e-5 |
+| log input code range (CLF and csp) | A log-input `fit` bake on a chain that responds above code 1.0 sets code max above 1 (1.188 on the test chain), writes a Range node and no Log node, tags the input ID with `codes0to…`, and both the CLF and the csp match Nuke on an image reaching above code 1.0. | exact / 3e-2 |
 | metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |
 
 Reference numbers on the OpenDRT test chain at 48³: lattice 1e-6, image
