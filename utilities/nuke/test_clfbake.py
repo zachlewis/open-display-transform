@@ -593,6 +593,98 @@ gen['format'].setValue('clf')
 gen['levels'].setValue('full')
 gen['log_input'].setValue(False)
 
+# --- 14. structure "view + display": LUT3D in display-linear, XYZ tap, native encoding --
+def node_tags(path):
+    return [e.tag + ('[' + e.get('style') + ']' if e.get('style') else '') + ('[half]' if e.get('halfDomain') else '')
+            for e in ET.parse(path).getroot() if e.tag in ('Log', 'Range', 'LUT3D', 'Matrix', 'Exponent', 'FixedFunction', 'LUT1D')]
+
+
+def lattice_check(name, path, g, s, tol):
+    s['pattern'].setValue(True)
+    lin_l, live_l = sample(s, W, H), sample(g, W, H)
+    s['pattern'].setValue(False)
+    check(name, max_err(apply_clf(path, lin_l), live_l), tol)
+
+
+# (a) SDR 2.4 Rec.709, peak 200: Exponent path; exact on the lattice
+gen['structure'].setValue('view + display')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+clf_sp = gen['file'].value()
+print('status:', gen['status'].value())
+tags = node_tags(clf_sp)
+ok_sp = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'Exponent[basicRev]'] \
+    and ET.parse(clf_sp).getroot().find('Info/CLFBake/Interop').get('intermediate') == 'ocio:lin_ciexyzd65_display' \
+    and "structure{'view+display'}" in ET.parse(clf_sp).getroot().get('id')
+print('%s view+display SDR structure: %s' % ('PASS' if ok_sp else 'FAIL', tags))
+if not ok_sp:
+    failures.append('view+display SDR structure')
+assert drt['eotf'].value() == '2.4 Power - Rec.1886' and drt['clamp'].value(), 'node knobs must be restored after the bake'
+# warm-up: Nuke 15.1 -t can serve stale samples right after a bake that toggled
+# knobs on the chain (EOTF, clamp, bake gain); one sample per node refreshes it
+for n in (img, shaper, drt, gen):
+    n.sample('red', 0.5, 0.5)
+lattice_check('view+display SDR: lattice exact', clf_sp, gen, shaper, 2e-4)
+check('view+display SDR: CLF vs Nuke', max_err(apply_clf(clf_sp, lin), sample(gen, W, H)), IMAGE_TOL)
+# (b) PQ Rec.2020 (P3 limited) 1000 nit as CLF: half-domain LUT1D
+d4['eotf'].setValue('PQ'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000); d4['clamp'].setValue(True)
+g3['structure'].setValue('view + display'); g3['format'].setValue('clf'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+clf_pqs = g3['file'].value()
+tags = node_tags(clf_pqs)
+ok_pq = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'LUT1D[half]']
+print('%s view+display PQ CLF structure: %s' % ('PASS' if ok_pq else 'FAIL', tags))
+if not ok_pq:
+    failures.append('view+display PQ structure')
+lattice_check('view+display PQ: lattice (half-domain)', clf_pqs, g3, s3, 1e-3)
+check('view+display PQ: CLF vs Nuke', max_err(apply_clf(clf_pqs, lin), sample(g3, W, H)), IMAGE_TOL)
+# (c) the same as CTF 2.4 with Lin_TO_PQ: structure here, evaluation needs OCIO >= 2.4
+g3['format'].setValue('ctf'); g3['ocio'].setValue('2.4'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+ctf_pq = g3['file'].value()
+r = ET.parse(ctf_pq).getroot()
+tags = node_tags(ctf_pq)
+ok_ctf = r.get('version') == '2.4' and tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'FixedFunction[Lin_TO_PQ]']
+print('%s view+display PQ CTF 2.4 structure: version %s %s' % ('PASS' if ok_ctf else 'FAIL', r.get('version'), tags))
+if not ok_ctf:
+    failures.append('view+display PQ CTF structure')
+try:
+    check('view+display PQ CTF 2.4: vs Nuke', max_err(apply_clf(ctf_pq, lin), sample(g3, W, H)), IMAGE_TOL)
+except Exception as e:
+    print('   (CTF 2.4 Lin_TO_PQ not evaluated: OCIO %s cannot read it: %s)' % (ocio.__version__, str(e).splitlines()[0][:80]))
+# (d) HLG as CTF: standard BT.2100 inverse OOTF + OETF, checked against the standard
+#     formula on the node's display-linear output (the Nuke node itself applies only
+#     20.5% of the inverse OOTF, see README)
+d4['eotf'].setValue('HLG'); g3['ocio'].setValue('2.1'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+ctf_hlg = g3['file'].value()
+tags = node_tags(ctf_hlg)
+ok_hlg = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'FixedFunction[Rec2100SurroundRev]', 'LUT1D[half]']
+print('%s view+display HLG CTF structure: %s' % ('PASS' if ok_hlg else 'FAIL', tags))
+if not ok_hlg:
+    failures.append('view+display HLG structure')
+d4['eotf'].setValue('Linear'); d4['clamp'].setValue(False)
+disp_lin = sample(g3, W, H)                       # display-linear, 1.0 = 1000 cd/m2
+d4['eotf'].setValue('HLG'); d4['clamp'].setValue(True)
+nuke_hlg = sample(g3, W, H)
+
+
+def std_hlg(p):
+    v = [min(max(c, 0.0), 1.0) for c in p]
+    yd = 0.2627 * v[0] + 0.6780 * v[1] + 0.0593 * v[2]
+    k = yd ** ((1.0 - 1.2) / 1.2) if yd > 0 else 0.0
+    out = []
+    for c in v:
+        e = c * k
+        out.append(math.sqrt(3.0 * e) if e <= 1.0 / 12.0 else 0.17883277 * math.log(12.0 * e - 0.28466892) + 0.55991073)
+    return out
+
+
+ref_hlg = [std_hlg(p) for p in disp_lin]
+check('view+display HLG CTF: vs standard BT.2100', max_err(apply_clf(ctf_hlg, lin), ref_hlg), IMAGE_TOL)
+print('   note: Nuke node HLG vs standard BT.2100 differs by max %.3f code (0.205 OOTF mix)' % max_err(nuke_hlg, ref_hlg))
+gen['structure'].setValue('baked'); g3['structure'].setValue('baked'); g3['format'].setValue('clf')
+
 print('outputs in', OUT)
 if failures:
     print('FAILED:', failures)

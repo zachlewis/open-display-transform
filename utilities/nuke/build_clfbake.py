@@ -136,6 +136,126 @@ def read_cube(path):
 CSP_PRELUT = 4096
 
 
+# --- display encoding as native nodes (structure "view + display") ---------------------
+def mat_inv(m):
+    a, b, c = m[0]; d, e, f = m[1]; g, h, i = m[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
+
+
+def mat_scale(m, s):
+    return [[v * s for v in row] for row in m]
+
+
+def npm(r, g, b, w):
+    """RGB -> XYZ matrix from xy chromaticities (rows X, Y, Z)."""
+    cols = [(x / y, 1.0, (1.0 - x - y) / y) for x, y in (r, g, b)]
+    m = [[cols[j][i] for j in range(3)] for i in range(3)]
+    wx = (w[0] / w[1], 1.0, (1.0 - w[0] - w[1]) / w[1])
+    inv = mat_inv(m)
+    s = [sum(inv[i][k] * wx[k] for k in range(3)) for i in range(3)]
+    return [[m[i][j] * s[j] for j in range(3)] for i in range(3)]
+
+
+IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def pq_encode(nits100):
+    m1, m2, c1, c2, c3 = 2610 / 16384., 2523 / 32., 107 / 128., 2413 / 128., 2392 / 128.
+    y = max(nits100, 0.0) / 100.0
+    ym = y ** m1
+    return min(1.0, ((c1 + c2 * ym) / (1.0 + c3 * ym)) ** m2)
+
+
+def hlg_oetf(e):
+    a, b, c = 0.17883277, 1.0 - 4.0 * 0.17883277, 0.5 - 0.17883277 * math.log(4.0 * 0.17883277)
+    if e <= 1.0 / 12.0:
+        return math.sqrt(3.0 * max(e, 0.0))
+    return a * math.log(12.0 * e - b) + c
+
+
+def half_domain_values(fn):
+    """65536 entries, one per half-float bit pattern, for a halfDomain LUT1D."""
+    import struct
+    out = []
+    for i in range(65536):
+        x = struct.unpack('<e', struct.pack('<H', i))[0]
+        if x != x:
+            v = 0.0
+        elif x == float('inf'):
+            v = fn(65504.0)
+        elif x == float('-inf'):
+            v = fn(-65504.0)
+        else:
+            v = fn(x)
+        out.append('%.7g' % v)
+    return out
+
+
+def add_matrix(root, m, note):
+    e = ET.SubElement(root, 'Matrix', inBitDepth='32f', outBitDepth='32f')
+    ET.SubElement(e, 'Description').text = note
+    ET.SubElement(e, 'Array', dim='3 3').text = '\n' + '\n'.join(
+        '            ' + ' '.join('%.10g' % v for v in row) for row in m) + '\n        '
+
+
+def add_range(root, lo_in, hi_in, lo_out, hi_out, note, no_clamp=False):
+    attrs = dict(inBitDepth='32f', outBitDepth='32f')
+    if no_clamp:
+        attrs['style'] = 'noClamp'
+    e = ET.SubElement(root, 'Range', attrs)
+    ET.SubElement(e, 'Description').text = note
+    for tag, val in (('minInValue', lo_in), ('maxInValue', hi_in), ('minOutValue', lo_out), ('maxOutValue', hi_out)):
+        ET.SubElement(e, tag).text = repr(float(val))
+
+
+def add_display_nodes(root, display, fixed_ok):
+    """After a LUT3D that outputs display-linear container RGB with 1.0 = peak
+    luminance (OpenDRT with EOTF Linear, clamp off): the CIE XYZ D65 tap, then
+    the display colorspace as native nodes. Returns the CTF version needed."""
+    eotf, gamut, lp, clamp = display['eotf'], display['gamut'], float(display['lp']), display['clamp']
+    gain = float(display.get('gain', 1.0))
+    M = IDENTITY if gamut == "X'Y'Z'" else npm(*XY[gamut])
+    add_matrix(root, mat_scale(M, lp / 100.0 / gain),
+               'view transform output: CIE XYZ D65 display-referred, 1.0 = 100 cd/m2 (ocio:lin_ciexyzd65_display)'
+               + ('; the LUT3D is stored x%g' % gain if gain != 1.0 else ''))
+    if eotf == 'Linear':
+        return '2'
+    inv = mat_inv(M)
+    version = '2'
+    if eotf == 'PQ':
+        add_matrix(root, inv, 'display colorspace: XYZ -> %s, 1.0 = 100 cd/m2' % gamut)
+        if clamp:
+            add_range(root, 0.0, 100.0, 0.0, 100.0, 'clamp 0..10000 cd/m2 (the node clamps before the EOTF)')
+        if fixed_ok and display.get('pq_fixed'):
+            ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='Lin_TO_PQ')
+            version = '2.4'
+        else:
+            lut = ET.SubElement(root, 'LUT1D', inBitDepth='32f', outBitDepth='32f', halfDomain='true')
+            ET.SubElement(lut, 'Description').text = 'ST 2084 PQ inverse EOTF, input 1.0 = 100 cd/m2'
+            ET.SubElement(lut, 'Array', dim='65536 1').text = '\n' + '\n'.join(
+                '            ' + v for v in half_domain_values(pq_encode)) + '\n        '
+    elif eotf == 'HLG':
+        add_matrix(root, mat_scale(inv, 0.1), 'display colorspace: XYZ -> %s, 1.0 = 1000 cd/m2' % gamut)
+        if clamp:
+            add_range(root, 0.0, 1.0, 0.0, 1.0, 'clamp 0..1000 cd/m2 (the node clamps before the EOTF)')
+        ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='Rec2100SurroundRev', params='1.2')
+        lut = ET.SubElement(root, 'LUT1D', inBitDepth='32f', outBitDepth='32f', halfDomain='true')
+        ET.SubElement(lut, 'Description').text = 'BT.2100 HLG OETF (after the inverse OOTF, system gamma 1.2)'
+        ET.SubElement(lut, 'Array', dim='65536 1').text = '\n' + '\n'.join(
+            '            ' + v for v in half_domain_values(hlg_oetf)) + '\n        '
+    else:
+        gamma = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
+        add_matrix(root, mat_scale(inv, 100.0 / lp), 'display colorspace: XYZ -> %s, 1.0 = peak luminance' % gamut)
+        if clamp:
+            add_range(root, 0.0, 1.0, 0.0, 1.0, 'clamp 0..peak (the node clamps before the EOTF)')
+        ex = ET.SubElement(root, 'Exponent', inBitDepth='32f', outBitDepth='32f', style='basicRev')
+        ET.SubElement(ex, 'ExponentParams', exponent=repr(gamma))
+    return version
+
+
 def bake_csp(path, clf_path, n, shaper, log_input, meta_lines):
     """Cinespace .csp through OpenColorIO's Baker, from the CLF: an in-memory
     config with a 'reference' colorspace (no transforms), a 'baked' colorspace
@@ -538,6 +658,7 @@ def interop_ids(node, ns, log_input, shaper, measured):
     gam, eotf, cont = node['in_gamut'].value(), node['eotf'].value(), node['display_gamut'].value()
     cwp, lp = node['cwp'].value(), node['tn_Lp'].value()
     g = GAMUT_SHORT.get(gam, 'unknown')
+    split_linear = bool(shaper.get('split')) and eotf == 'Linear'   # view+display with no display part: XYZ out
     if log_input:
         if shaper['shortname'] == 'acescct' and g == 'ap1':
             in_id, in_fb = 'ocio:acescct_ap1_scene', None
@@ -553,6 +674,8 @@ def interop_ids(node, ns, log_input, shaper, measured):
         in_id = '%s:%s|codes%gto%g' % (ns, base, c0, c1)
     base = '%s_%s_display' % (EOTF_SHORT[eotf], CONTAINER_SHORT[cont])
     base = OUT_ALIAS.get(base, base)
+    if split_linear:
+        base = 'ocio:lin_ciexyzd65_display'
     conform = PUBLISHED_OUT.get(base)
     if conform == 'lp/100':
         conform = lp / 100.0
@@ -657,7 +780,8 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
                 params=params, node=node)
 
 
-def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True, fmt='clf'):
+def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True, fmt='clf',
+              display=None):
     """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k).
     measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None.
     path may be a directory: the file is then named automatically with `fmt`
@@ -687,6 +811,8 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         if is_opendrt(node):
             desc = describe_opendrt(nb, node, log_input, measured, shaper)
     conform = desc['conform'] if desc else None
+    if display and display['eotf'] == 'Linear':
+        conform = None   # the XYZ tap matrix already puts 1.0 at 100 cd/m2
     # file name and id
     as_dir = os.path.isdir(path) or path.endswith(('/', os.sep))
     if as_dir:
@@ -702,9 +828,9 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
     legal_in, legal_out = bool(log_input and shaper.get('legal_in')), bool(shaper.get('legal_out'))
     levels = ('L' if legal_in else 'E') + ('L' if legal_out else 'E')
-    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}levels{%s}%s}' % (
+    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}levels{%s}structure{%s}%s}' % (
         pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1,
-        pq(levels), 'codes{%r,%r}' % (c0, c1) if ranged else '')
+        pq(levels), pq('view+display' if display else 'baked'), 'codes{%r,%r}' % (c0, c1) if ranged else '')
     pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
     root.set('id', pid)
     csp_path = None
@@ -742,6 +868,16 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
             ET.SubElement(rng, tag).text = repr(val)
     lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
+    if display:
+        ET.SubElement(lut, 'Description').text = ('output: display-linear %s x%g, 1.0/%g = peak luminance, unclamped'
+                                                  % (display['gamut'], display.get('gain', 1.0), display.get('gain', 1.0)))
+        needed = add_display_nodes(root, display, fixed_ok=(ext == '.ctf'))
+        if ext == '.ctf' and needed == '2.4':
+            root.set('version', '2.4')
+        inter = nb.find('Interop')
+        if inter is not None:
+            inter.set('structure', 'view+display')
+            inter.set('intermediate', 'ocio:lin_ciexyzd65_display')
     if conform is not None:
         m = ET.SubElement(root, 'Matrix', inBitDepth='32f', outBitDepth='32f')
         ET.SubElement(m, 'Description').text = 'conform output scale %r (see Info/CLFBake/Interop)' % conform
@@ -962,6 +1098,25 @@ shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
 shaper['cube_size'] = int(shaper_node['cube_size'].value())
 shaper['legal_in'] = gen['levels'].value() in ('legal in', 'legal in and out')
 shaper['legal_out'] = gen['levels'].value() in ('legal out', 'legal in and out')
+
+# structure "view + display": bake the OpenDRT node with EOTF Linear and clamp
+# off, so the LUT3D holds display-linear RGB, and write the display encoding
+# as native nodes behind a CIE XYZ D65 tap
+display, split_note = None, ''
+drt_node = next((x for x in nodes if is_opendrt(x)), None)
+if gen['structure'].value() == 'view + display':
+    if drt_node is None:
+        split_note = ', view+display needs an OpenDRT node: baked'
+    else:
+        fp = gen['file'].evaluate()
+        want_ext = os.path.splitext(fp)[1].lower() if fp and not (os.path.isdir(fp) or fp.endswith('/')) else '.' + gen['format'].value()
+        if drt_node['eotf'].value() == 'HLG' and want_ext != '.ctf':
+            split_note = ', HLG view+display needs CTF (FixedFunction OOTF): baked'
+        else:
+            display = dict(eotf=drt_node['eotf'].value(), gamut=drt_node['display_gamut'].value(),
+                           lp=drt_node['tn_Lp'].value(), clamp=bool(drt_node['clamp'].value()),
+                           pq_fixed=(gen['ocio'].value() == '2.4'))
+            shaper['split'] = True
 log_input = bool(gen['log_input'].value())
 
 path = gen['file'].evaluate()
@@ -977,16 +1132,27 @@ try:
 finally:
     shaper_node['probe'].setValue(False)
 shaper_node['pattern'].setValue(True)
+saved = (drt_node['eotf'].value(), drt_node['clamp'].value()) if display else None
 try:
+    if display:
+        drt_node['eotf'].setValue('Linear')
+        drt_node['clamp'].setValue(False)
+        display['gain'] = 16384.0
+        gen['bake_gain'].setValue(display['gain'])
     tmp = bake_cube(gen.node('GenerateLUT1'))
 finally:
     shaper_node['pattern'].setValue(False)
+    gen['bake_gain'].setValue(1.0)
+    if saved:
+        drt_node['eotf'].setValue(saved[0])
+        drt_node['clamp'].setValue(saved[1])
 size, path, pid = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
-                            measured, bool(gen['embed_script'].value()), gen['format'].value())
+                            measured, bool(gen['embed_script'].value()), gen['format'].value(), display)
 os.remove(tmp)
 gen['file'].setValue(path)
-gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
-    os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'], fit_note))
+gen['status'].setValue('wrote %s (%d nodes, %d^3, %s%s)%s%s' % (
+    os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'],
+    ', view+display' if display else '', fit_note, split_note))
 '''
 
 
@@ -1238,7 +1404,11 @@ def build_generate():
     g = nuke.nodes.Group(name='CLFGenerate')
     g.begin()
     inp = nuke.nodes.Input(name='Input1')
-    lut = nuke.nodes.GenerateLUT(name='GenerateLUT1', inputs=[inp])
+    # GenerateLUT writes six decimals; display-linear bakes are scaled up by
+    # bake_gain (2^14) here and divided back out in the CLF's first Matrix
+    gain = nuke.nodes.Multiply(name='BakeGain', inputs=[inp])
+    gain['value'].setExpression('parent.bake_gain')
+    lut = nuke.nodes.GenerateLUT(name='GenerateLUT1', inputs=[gain])
     lut['file_type'].setValue('.cube')
     nuke.nodes.Output(name='Output1', inputs=[inp])
     g.end()
@@ -1255,6 +1425,19 @@ def build_generate():
     g.addKnob(k)
     k = nuke.Enumeration_Knob('interpolation', 'interpolation', ['tetrahedral', 'trilinear'])
     k.setTooltip('Interpolation recorded in the LUT3D node.')
+    g.addKnob(k)
+    k = nuke.Enumeration_Knob('structure', 'structure', ['baked', 'view + display'])
+    k.setTooltip('baked: the LUT3D holds everything up to output code values.\n'
+                 'view + display: the LUT3D holds the OpenDRT render as display-linear RGB (baked with EOTF '
+                 'Linear and clamp off), followed by a Matrix to CIE XYZ D65 (1.0 = 100 cd/m2, the OCIO '
+                 'display interchange) and the display colorspace as native nodes: Matrix, Range clamp, '
+                 'Exponent for power EOTFs, PQ as Lin_TO_PQ (CTF 2.4) or a half-domain LUT1D, HLG as the '
+                 'standard BT.2100 inverse OOTF (FixedFunction, CTF only) plus OETF LUT1D. Needs an OpenDRT '
+                 'node in the chain.')
+    g.addKnob(k)
+    k = nuke.Enumeration_Knob('ocio', 'ctf target', ['2.1', '2.4'])
+    k.setTooltip('Which OCIO/CTF features a CTF may use. 2.4 enables the Lin_TO_PQ FixedFunction for PQ; '
+                 '2.1 writes PQ as a half-domain LUT1D, which Nuke 15 and 16 (OCIO 2.2 and 2.3) can read.')
     g.addKnob(k)
     k = nuke.Enumeration_Knob('levels', 'levels', ['full', 'legal in', 'legal out', 'legal in and out'])
     k.setTooltip('Code value range of the file\'s input and output. full: 0-1 as the chain produces (what the '
@@ -1293,6 +1476,10 @@ def build_generate():
                  'upstream CLFShaper and this node, and restore the shaper. Baking again reproduces the CLF.')
     g.addKnob(k)
     g.addKnob(nuke.Text_Knob('status', ' ', ''))
+    k = nuke.Double_Knob('bake_gain', 'bake gain')
+    k.setValue(1.0)
+    k.setFlag(nuke.INVISIBLE)
+    g.addKnob(k)
     g.addKnob(nuke.Tab_Knob('About'))
     g.addKnob(nuke.Text_Knob('about', ' ', ABOUT % ('CLFGenerate',
         'Bakes everything between the upstream CLFShaper and this node into a CLF or CTF: a parametric '
