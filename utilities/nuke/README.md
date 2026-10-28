@@ -299,6 +299,30 @@ Where things live in the builder:
 - **Probe ramps**: the `ProbeRamp` expressions in `build_shaper` and the
   thresholds (`/ 1023.0`, the 5-stop toe guard `2.0 ** -5`) in `GENERATE`.
 
+## Deploying with rez
+
+`utilities/rez/nuke_opendrt/` is a rez package definition in the same idiom as
+the other `nuke_*` packages: `plugin_for = ['nuke']`, `requires =
+['nuke-15.1+']`, and one `NUKE_PATH.append` to its `nuke/` directory. The
+build (`build.py`, pure Python) copies `display-transforms/opendrt`,
+`utilities/nuke`, the DCTLs, LICENSE and README out of the checkout and places
+`OpenDRT.nk` and `CLFBake.nk` under `nuke/ToolSets/OpenDRT/`, so they appear
+in Nuke under **Nodes > ToolSets > OpenDRT** with no menu Python at all. The
+version follows the local date convention (`YY.M.D.N`).
+
+```
+cd utilities/rez/nuke_opendrt
+rez-build -i                       # build + install to the local packages path
+rez-env nuke_opendrt fxphd -- nuke # Nuke with the ToolSets on NUKE_PATH
+rez-test nuke_opendrt              # runs test_clfbake.py in the resolved Nuke
+```
+
+`rez-test` is the same harness as above, executed from the installed copy, so
+a package is verified in the environment artists will actually resolve. To
+release facility-wide use `rez-release` from a clean, tagged checkout; that is
+deliberate and irreversible, so it is not scripted here. The DCTLs are shipped
+for reference only; Resolve still needs them copied into its LUT folder.
+
 ## Nuke gotchas
 
 Things that cost time while building this, so you don't pay twice:
