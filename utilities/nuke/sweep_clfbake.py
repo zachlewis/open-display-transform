@@ -227,7 +227,7 @@ for i, (name, (pk, pl), disp, knobs) in enumerate(configs):
     # 1.8e-2 at 97^3 for an all-modules-off bake, median error zero
     # automatic file name: an untouched look preset names itself
     fname = os.path.basename(clf)
-    look_part = fname.split('__')[0].split('-', 1)[1].rsplit('-', 1)[0]   # OpenDRT_v..-<look>-<condition>__...
+    look_part = '_'.join(fname.split('__')[0].split('_')[1:-1])   # OpenDRT-v.._<look>_<condition>__...
     name_ok = (look_part == pl.replace(' ', '')) if name.startswith('look ') else bool(look_part)
     ok = p99 <= IMAGE_TOL and err <= 2 * IMAGE_TOL and not bad_knobs and identical and not bad_model and id_ok and name_ok
     rows.append((ok, name, disp if not name.startswith('display') else '', err, len(kv), len(bad_knobs), identical, out_id))
