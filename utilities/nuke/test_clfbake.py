@@ -476,6 +476,44 @@ print('%s opendrt button auto name: %s' % ('PASS' if ok_btn else 'FAIL', base2))
 if not ok_btn:
     failures.append('button auto name')
 
+# --- 11. Cinespace output -----------------------------------------------------------
+gen['format'].setValue('csp')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+csp = gen['file'].value()
+gen['format'].setValue('clf')
+txt = open(csp).read().splitlines()
+ok_csp = csp.endswith('.csp') and txt[0] == 'CSPLUTV100' and txt[1] == '3D' and txt.count('4096') == 3 \
+    and any(l.startswith('id opendrt1_1{') for l in txt)
+print('%s csp structure: %s' % ('PASS' if ok_csp else 'FAIL', os.path.basename(csp)))
+if not ok_csp:
+    failures.append('csp structure')
+shaper.setInput(0, img)
+live = sample(gen, W, H)
+# end to end through OCIO, whose csp reader resamples the prelut into a uniform
+# 65536-entry 1D LUT over its input range (coarse in the shadows for a 512 top)
+check('csp: vs Nuke (OCIO reader)', max_err(apply_clf(csp, lin), live), IMAGE_TOL)
+# structural: the prelut points lie exactly on the CLF's Log node, and the cube
+# rows are the CLF's rows (csp red-fastest, CLF blue-fastest)
+lp = clf_core(auto_path)[0]
+log = ocio.LogCameraTransform(base=2.0, linSideBreak=[float(lp['linSideBreak'])] * 3,
+                              logSideSlope=[float(lp['logSideSlope'])] * 3, logSideOffset=[float(lp['logSideOffset'])] * 3,
+                              linSideSlope=[float(lp['linSideSlope'])] * 3, linSideOffset=[float(lp['linSideOffset'])] * 3,
+                              linearSlope=[float(lp['linearSlope'])] * 3)
+lcpu = ocio.Config.CreateRaw().getProcessor(log).getDefaultCPUProcessor()
+i = txt.index('END METADATA') + 2
+n_pre = int(txt[i]); pre_in = [float(v) for v in txt[i + 1].split()]; pre_out = [float(v) for v in txt[i + 2].split()]
+pre_err = max(abs(lcpu.applyRGB([x, x, x])[0] - y) for x, y in zip(pre_in, pre_out))
+check('csp: prelut points on the Log node', pre_err, 1e-5)
+size_line = next(k for k, l in enumerate(txt) if l == '48 48 48')
+csp_rows = [tuple(l.split()) for l in txt[size_line + 1:size_line + 1 + 48 ** 3]]
+N = 48
+csp_bf = [csp_rows[r + N * g + N * N * b] for r in range(N) for g in range(N) for b in range(N)]
+same = csp_bf == [tuple(r) for r in clf_core(auto_path)[1]]
+print('%s csp: cube rows identical to the CLF (%d rows, n_prelut %d)' % ('PASS' if same and n_pre == 4096 else 'FAIL', len(csp_rows), n_pre))
+if not (same and n_pre == 4096):
+    failures.append('csp cube rows')
+
 print('outputs in', OUT)
 if failures:
     print('FAILED:', failures)

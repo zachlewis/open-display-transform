@@ -126,8 +126,41 @@ def read_cube(path):
             rows.append(' '.join(t))
     if n is None or len(rows) != n ** 3:
         raise RuntimeError('unexpected cube %s: size %s, %d rows' % (path, n, len(rows)))
-    # .cube is red-fastest, CLF Array is blue-fastest
-    return n, [rows[r + n * g + n * n * b] for r in range(n) for g in range(n) for b in range(n)]
+    # .cube (and .csp) are red-fastest, the CLF Array is blue-fastest
+    return n, [rows[r + n * g + n * n * b] for r in range(n) for g in range(n) for b in range(n)], rows
+
+
+def shaper_inverse(sh, code):
+    """log code value -> linear, for a shaper dict (gs go ls lo lb sl)."""
+    logbreak = sh['gs'] * math.log(sh['ls'] * sh['lb'] + sh['lo'], 2) + sh['go']
+    if code <= logbreak:
+        return (code - (logbreak - sh['sl'] * sh['lb'])) / sh['sl']
+    return (2.0 ** ((code - sh['go']) / sh['gs']) - sh['lo']) / sh['ls']
+
+
+CSP_PRELUT = 4096
+
+
+def write_csp(path, n, rows_red_fastest, shaper, log_input, conform, meta_lines):
+    """Cinespace .csp: 1D prelut per channel (the shaper, 4096 log-spaced
+    samples) followed by the 3D cube. Everything else stays in the metadata."""
+    if log_input:
+        pre_in, pre_out = ['0', '1'], ['0', '1']
+    else:
+        codes = [j / float(CSP_PRELUT - 1) for j in range(CSP_PRELUT)]
+        pre_in = ['%.9g' % shaper_inverse(shaper, c) for c in codes]
+        pre_out = ['%.9g' % c for c in codes]
+    out = ['CSPLUTV100', '3D', '', 'BEGIN METADATA']
+    out += [l for l in meta_lines if l.strip()]
+    out += ['END METADATA', '']
+    for _ in range(3):
+        out += [str(len(pre_in)), ' '.join(pre_in), ' '.join(pre_out), '']
+    out.append('%d %d %d' % (n, n, n))
+    if conform is None:
+        out += rows_red_fastest
+    else:
+        out += [' '.join('%.9g' % (float(v) * conform) for v in r.split()) for r in rows_red_fastest]
+    open(path, 'w').write('\n'.join(out) + '\n')
 
 
 def chain_script(nodes):
@@ -575,12 +608,13 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
                 params=params, node=node)
 
 
-def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True):
+def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True, fmt='clf'):
     """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k).
     measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None.
-    path may be a directory: the file is then named automatically (.clf).
-    Returns (lattice size, final path, ProcessList id)."""
-    n, rows = read_cube(cube)
+    path may be a directory: the file is then named automatically with `fmt`
+    (clf, ctf or csp); an explicit extension on a file path wins.
+    Returns (lattice size, final path, id string)."""
+    n, rows, rows_rf = read_cube(cube)
     tail = nodes[-1]
     root = ET.Element('ProcessList')
     root.set('name', tail.name())
@@ -608,9 +642,9 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     if as_dir:
         base = (opendrt_filename(desc['node'], desc['version'], desc['in_id'], desc['out_id'], desc['condition'], shaper)
                 if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size'])))
-        path = os.path.join(path, base + '.clf')
-    ctf = os.path.splitext(path)[1].lower() == '.ctf'
-    if ctf:
+        path = os.path.join(path, base + '.' + fmt)
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.ctf':
         root.set('version', '2')
     else:
         root.set('compCLFversion', '3')
@@ -618,6 +652,21 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1)
     pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
     root.set('id', pid)
+    if ext == '.csp':
+        inter = nb.find('Interop')
+        meta = ['id %s' % pid, 'input %s' % root.find('InputDescriptor').text,
+                'output %s' % root.find('OutputDescriptor').text,
+                'shaper %s %s (%d-point prelut)' % (shaper['preset'], shaper['shortname'], CSP_PRELUT)]
+        if inter is not None:
+            meta += ['interop_input %s' % inter.get('input', ''), 'interop_output %s' % inter.get('output', '')]
+            if inter.get('outputConform'):
+                meta.append('output_conform %s (baked into the cube)' % inter.get('outputConform'))
+        if desc:
+            mast = nb.find('Mastering')
+            meta.append('viewing_condition %s' % mast.find('ViewingEnvironment').get('condition'))
+            meta.append('peak_luminance %s' % mast.find('DisplayColorVolume').get('maxLuminance'))
+        write_csp(path, n, rows_rf, shaper, log_input, conform, meta)
+        return n, path.replace(os.sep, '/'), pid
     if embed_script:
         ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
@@ -817,7 +866,7 @@ try:
 finally:
     shaper_node['pattern'].setValue(False)
 size, path, pid = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
-                            measured, bool(gen['embed_script'].value()))
+                            measured, bool(gen['embed_script'].value()), gen['format'].value())
 os.remove(tmp)
 gen['file'].setValue(path)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
@@ -1069,7 +1118,13 @@ def build_generate():
 
     g.addKnob(nuke.Tab_Knob('CLFGenerate'))
     k = nuke.File_Knob('file', 'file')
-    k.setTooltip('Output path. Use a .ctf extension to write CTF instead of CLF. Empty: next to the script, named after the baked node.')
+    k.setTooltip('Output path. A directory, or empty (the script\'s directory), names the file automatically '
+                 'in the chosen format; an explicit .clf / .ctf / .csp extension wins.')
+    g.addKnob(k)
+    k = nuke.Enumeration_Knob('format', 'format', ['clf', 'ctf', 'csp'])
+    k.setTooltip('clf: Academy/ASC Common LUT Format, parametric Log shaper + LUT3D + metadata. '
+                 'ctf: the same as OCIO CTF. csp: Cinespace, the shaper as a 4096-point 1D prelut '
+                 'per channel + the 3D cube, for hosts without CLF; metadata is a text block.')
     g.addKnob(k)
     k = nuke.Enumeration_Knob('interpolation', 'interpolation', ['tetrahedral', 'trilinear'])
     k.setTooltip('Interpolation recorded in the LUT3D node.')
