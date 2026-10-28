@@ -34,7 +34,7 @@ chain as linear.
 
 | Knob | Meaning |
 |---|---|
-| file | Output path. A `.ctf` extension writes CTF instead of CLF. Empty: next to the script, named `<node>__<shaper>.clf`. |
+| file | Output path. A `.ctf` extension writes CTF instead of CLF. A directory, or empty (the script's directory), names the file automatically; see below. |
 | interpolation | Recorded in the LUT3D node. Tetrahedral by default. |
 | log input | Omit the Log node and declare the shaper's log encoding as the input, the way the released OpenDRT config consumes its cubes. Off by default: the shaper is embedded and the CLF takes linear input. |
 | embed node script | Also store the baked nodes as a Nuke script in the CLF so From CLF can rebuild them. On by default; the structured metadata is written regardless. |
@@ -56,8 +56,46 @@ the CLF exactly, like any preset. Measured on OpenDRT with inputs up to 8192
 linear, T-LogE clamps at 3.0e-2 worst case regardless of size; the fitted XLog
 reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 
+**Automatic file names.** When `file` is a directory (or empty), the name is
+explicit and deterministic, never random:
+
+```
+OpenDRT-<version>_<look>_<input id>_to_<output id>_<condition>_<shaper><size>.clf
+OpenDRT-1.1.0_Standard_lin_egamut2_scene_to_g24_rec709_display_video100_tloge48.clf
+OpenDRT-1.1.0_LowContrast-6f137a09_lin_ap1_scene_to_pq_rec2020_display-p3lim-dw148_cinema1000_tloge48.clf
+```
+
+`<look>` is the look preset's name when the node still matches one of its own
+look presets exactly (checked against the pulldown's `knobs` commands); else
+the tonescale preset's name plus an 8-hex hash when only the tonescale still
+matches; else the hash alone. The hash is a UUID5 of the look parameters only,
+so changing the display does not change it, and the same look hashes the same
+from the standalone pair and the OpenDRT button. Interop IDs lose their
+namespace and use `-` for `|`; the condition carries surround and peak nits.
+For chains the tool does not recognise the name is `<node>__<shaper><size>`.
+
+**Parameter string.** Every recognised OpenDRT node is also written as one
+parseable string, in the FilmLight manner of a DRT whose parameters travel in
+its name:
+
+```
+opendrt1_1{look_name{'Standard'}input{in_gamut{'Filmlight E-Gamut2'}}tonescale{tn_Lp{100.0}tn_Lg{10.0}
+tn_gb{0.13}tn_con{1.66}tn_sh{0.5}tn_toe{0.003}tn_off{0.005}tn_su{'dim'}}highcontrast{…}…
+output{eotf{'2.4 Power - Rec.1886'}display_gamut{'Rec.709'}clamp{1}display_name{'…'}}}
+clfbake{shaper{'tloge'}size{48}interpolation{'tetrahedral'}embedded{1}}
+```
+
+Groups are the Model modules, leaf keys are the parameter ids, numbers are
+bare, booleans `0`/`1`, strings and enumeration labels single-quoted with `\'`
+and `\\` escapes, lists comma-separated. It is the CLF's `ProcessList id`, it
+is repeated in `<Info><NukeBake><Params>`, and the OpenDRT node's CLF Helpers
+carry it in a `params` field with **Apply Params**: paste a string from any
+CLF's id, or type one, and the node takes those values. The parser flattens
+groups, so a hand-written `opendrt1_1{tn_Lp{1000}eotf{'PQ'}}` is valid too.
+
 **OpenDRT.nk** also carries a "CLF Helpers" group next to Jed's DCTL Helpers:
-a file knob, **Bake CLF** and **Restore CLF**. Bake CLF wraps the node in the
+a file knob, **Bake CLF**, **Restore CLF**, and the `params` field with
+**Apply Params**. Bake CLF wraps the node in the
 T-LogE shaper at 48³, tetrahedral, exactly the recipe of the released OpenDRT
 config, and writes the same metadata, so its CLFs restore and rebuild through
 CLFGenerate and vice versa. Use the standalone pair for another shaper, size,
@@ -237,6 +275,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | auto keeps a sufficient preset | `domain: auto` leaves a preset alone when it already covers the chain. | exact |
 | fit: CLF vs Nuke, above top, below floor | A fitted XLog matches within interpolation error, clamping beyond the fitted top costs nothing, and the floor is within tolerance. | 3e-2 / 5e-3 / 3e-2 |
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
+| auto file names, parameter string, opendrt button auto name | A modified node names by hash, an untouched one by look preset, a tonescale-only change by tonescale name plus hash, and the hash survives a peak-luminance change; the CLF id parses and, applied to a fresh node through Apply Params, reproduces every recorded knob; the OpenDRT button names and hashes identically. | exact |
 | metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |
 
 Reference numbers on the OpenDRT test chain at 48³: lattice 1e-6, image

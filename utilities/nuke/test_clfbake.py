@@ -408,6 +408,73 @@ g3['generate'].execute()
 meta_checks('linear xyz 1000nit', clf_lx, d4, 'ocio:lin_ciexyzd65_display', ('10', '8'), None, in_id='lin_ap1_scene',
             conform=10.0, tail=d4)
 
+# --- 10. automatic file name and the parameter string --------------------------------
+import re
+
+
+def auto_bake(g, d, label):
+    g['file'].setValue(OUT + '/')          # directory only
+    g['generate'].execute()
+    path = g['file'].value()
+    base = os.path.basename(path)
+    print('   %-28s %s' % (label, base))
+    return path, base
+
+
+# drt is modified (tn_con, hs_r, ...), tn_Lp 200: expect a hash, not a look name
+shaper['preset'].setValue(0)   # back to T-LogE after the fit section
+auto_path, base = auto_bake(gen, drt, 'modified node')
+pat = r'OpenDRT-1\.1\.0_[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video200_tloge48\.clf$'
+ok_mod = re.match(pat, base) is not None and os.path.exists(auto_path)
+# untouched node: look name
+for n in nuke.allNodes():
+    n.setSelected(False)
+s6, g6 = paste(CLFBAKE)
+if 'clfbake_shaper' not in s6.knobs():
+    s6, g6 = g6, s6
+d6 = paste(OPENDRT)[0]
+s6.setInput(0, img); d6.setInput(0, s6); g6.setInput(0, d6)
+_, base6 = auto_bake(g6, d6, 'untouched node')
+ok_std = re.match(r'OpenDRT-1\.1\.0_Standard_lin_egamut_scene_to_g24_rec709_display_video100_tloge48\.clf$', base6) is not None
+# tonescale preset applied over Standard: tonescale name + hash (look no longer matches)
+vals = d6['tn_presets'].values()
+for i in range(0, len(vals) - 1, 2):
+    if vals[i].endswith('/Low Contrast'):
+        nuke.tcl(vals[i + 1].replace('knobs this', 'knobs %s' % d6.fullName()))
+_, base_tn = auto_bake(g6, d6, 'tonescale Low Contrast')
+ok_tn = re.match(r'OpenDRT-1\.1\.0_LowContrast-[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video100_tloge48\.clf$', base_tn) is not None
+# same look parameters twice -> same hash (deterministic), display change does not alter it
+d6['tn_Lp'].setValue(400)
+_, base_tn2 = auto_bake(g6, d6, 'same look, Lp 400')
+ok_det = base_tn.split('_')[1] == base_tn2.split('_')[1] and 'video400' in base_tn2
+print('%s auto file names: modified %s, untouched %s, tonescale %s, deterministic %s'
+      % ('PASS' if all((ok_mod, ok_std, ok_tn, ok_det)) else 'FAIL', ok_mod, ok_std, ok_tn, ok_det))
+if not all((ok_mod, ok_std, ok_tn, ok_det)):
+    failures.append('auto file names')
+
+# the CLF id is the parameter string; applying it to another node reproduces every recorded knob
+pid = ET.parse(auto_path).getroot().get('id')
+params_el = ET.parse(auto_path).getroot().find('Info/NukeBake/Params').text
+ok_id = pid.startswith('opendrt1_1{') and 'clfbake{' in pid and pid.startswith(params_el)
+d6['clf_params'].setValue(pid)
+d6['apply_params'].execute()
+recorded = list(clf_core(auto_path)[2])
+bad = [k for k in recorded if drt[k].toScript() != d6[k].toScript()]
+print('%s parameter string: id ok %s, applied to a fresh node %d/%d recorded knobs equal %s'
+      % ('PASS' if ok_id and not bad else 'FAIL', ok_id, len(recorded) - len(bad), len(recorded), bad))
+if not ok_id or bad:
+    failures.append('parameter string')
+print('   id:', pid[:160] + ('...' if len(pid) > 160 else ''))
+# the OpenDRT button names its file the same way and fills the params field
+d2['clf_file'].setValue(OUT + '/')
+d2['bake_clf'].execute()
+base2 = os.path.basename(d2['clf_file'].value())
+ok_btn = re.match(r'OpenDRT-1\.1\.0_[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video200_tloge48\.clf$', base2) is not None \
+    and d2['clf_params'].value().startswith('opendrt1_1{')
+print('%s opendrt button auto name: %s' % ('PASS' if ok_btn else 'FAIL', base2))
+if not ok_btn:
+    failures.append('button auto name')
+
 print('outputs in', OUT)
 if failures:
     print('FAILED:', failures)

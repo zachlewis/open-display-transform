@@ -177,9 +177,9 @@ for i, (name, (pk, pl), disp, knobs) in enumerate(configs):
         drt[k].setValue(v)
     log_input = name.endswith('log input')
     g1['log_input'].setValue(log_input)
-    clf = os.path.join(OUT, 'sweep_%02d.clf' % i)
-    g1['file'].setValue(clf)
+    g1['file'].setValue(OUT + '/')          # directory only: automatic, explicit name
     g1['generate'].execute()
+    clf = g1['file'].value()
     live = sample(g1)
     src = [[lin_to_log(s1, c) for c in p] for p in lin] if log_input else lin
     lp, arr, kv, nb = clf_core(clf)
@@ -225,12 +225,16 @@ for i, (name, (pk, pl), disp, knobs) in enumerate(configs):
     # because a hard clip in the chain (purity compression off) puts a lattice
     # cell across a discontinuity: measured 3.3e-2 at 48^3, 2.4e-2 at 65^3,
     # 1.8e-2 at 97^3 for an all-modules-off bake, median error zero
-    ok = p99 <= IMAGE_TOL and err <= 2 * IMAGE_TOL and not bad_knobs and identical and not bad_model and id_ok
+    # automatic file name: an untouched look preset names itself
+    fname = os.path.basename(clf)
+    look_part = fname.split('_')[1]
+    name_ok = (look_part == pl.replace(' ', '')) if name.startswith('look ') else bool(look_part)
+    ok = p99 <= IMAGE_TOL and err <= 2 * IMAGE_TOL and not bad_knobs and identical and not bad_model and id_ok and name_ok
     rows.append((ok, name, disp if not name.startswith('display') else '', err, len(kv), len(bad_knobs), identical, out_id))
-    print('%s %-42s max %.2e p95 %.2e  restore %d/%d  rebake %s  model %s  out %s%s' % (
+    print('%s %-42s max %.2e p95 %.2e  restore %d/%d  rebake %s  model %s  out %s%s\n      %s' % (
         'PASS' if ok else 'FAIL', name, err, p99, len(kv) - len(bad_knobs), len(kv),
         'identical' if identical else 'DIFFERS', 'ok' if not bad_model else bad_model, out_id,
-        '' if id_ok else '  (expected %s)' % expected))
+        '' if id_ok else '  (expected %s)' % expected, fname))
     if not ok:
         failures.append(name)
     nuke.delete(fresh)

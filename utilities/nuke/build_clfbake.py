@@ -71,7 +71,7 @@ def inverse_expr(c, par):
 # ---------------------------------------------------------------------------
 # Python shared by every button. Pure stdlib + nuke.
 # ---------------------------------------------------------------------------
-COMMON = r'''import os, math, datetime, tempfile
+COMMON = r'''import os, re, math, uuid, datetime, tempfile
 import xml.etree.ElementTree as ET
 import nuke
 
@@ -87,7 +87,7 @@ SKIP_NAMES = ('name', 'xpos', 'ypos', 'selected', 'tile_color', 'note_font',
               'lifetimeEnd', 'useLifetime', 'lock_connections', 'help',
               'mapsize', 'window', 'rootNodeUpdated', 'process_mask',
               'disable', 'label', 'group_view_position', 'show_group_view',
-              'disable_group_view', 'clf_file')
+              'disable_group_view', 'clf_file', 'clf_params')
 
 
 def knob_values(n):
@@ -144,8 +144,9 @@ def chain_script(nodes):
             n.setSelected(n in sel)
     txt = open(tmp).read()
     os.remove(tmp)
-    # the bake path is not part of the node's recipe
-    return '\n'.join(l for l in txt.splitlines() if not l.strip().startswith('clf_file ')) + '\n'
+    # the bake path and the derived parameter string are not part of the node's recipe
+    return '\n'.join(l for l in txt.splitlines()
+                     if not l.strip().startswith(('clf_file ', 'clf_params '))) + '\n'
 
 
 # --- structured description of recognised models -------------------------------
@@ -232,6 +233,205 @@ def fmt(v):
     return str(v)
 
 
+# --- parameter strings: name{key{value}group{key{'text'}}} -------------------------
+# FilmLight-style parseable parameter string. Numbers bare, booleans 0/1,
+# strings and enumeration labels single-quoted (\' and \\ escaped), lists
+# comma-separated. Groups follow the Model modules; the parser flattens them,
+# so only the leaf keys (the model's parameter ids) matter.
+def pq(s):
+    return "'" + str(s).replace('\\', '\\\\').replace("'", "\\'") + "'"
+
+
+def pval(k):
+    cls = k.Class()
+    if cls == 'Boolean_Knob':
+        return '1' if k.value() else '0'
+    if cls == 'Enumeration_Knob':
+        return pq(k.value())
+    v = k.value()
+    if isinstance(v, float):
+        return repr(v)
+    if isinstance(v, (list, tuple)):
+        return ','.join(repr(float(x)) for x in v)
+    return pq(v)
+
+
+def opendrt_string(node, version):
+    parts = ['look_name{%s}' % pq(node['look_name'].value())] if 'look_name' in node.knobs() else []
+    for elem, ids in OPENDRT_MODEL:
+        inner = ''.join('%s{%s}' % (pid, pval(node[pid])) for pid in ids if pid in node.knobs())
+        parts.append('%s{%s}' % (elem.lower(), inner))
+    return 'opendrt%s{%s}' % ('_'.join(version.split('.')[:2]), ''.join(parts))
+
+
+def parse_params(s):
+    """'name{k{v}g{k{'t'}}}...' -> {name: nested dict}; scalar blocks become values or lists."""
+    pos = [0]
+
+    def ws():
+        while pos[0] < len(s) and s[pos[0]] in ' \t\r\n':
+            pos[0] += 1
+
+    def ident():
+        ws()
+        st = pos[0]
+        while pos[0] < len(s) and (s[pos[0]].isalnum() or s[pos[0]] in '_-.+'):
+            pos[0] += 1
+        return s[st:pos[0]]
+
+    def scalar():
+        ws()
+        if s[pos[0]] == "'":
+            pos[0] += 1
+            out = ''
+            while s[pos[0]] != "'":
+                if s[pos[0]] == '\\':
+                    pos[0] += 1
+                out += s[pos[0]]
+                pos[0] += 1
+            pos[0] += 1
+            return out
+        st = pos[0]
+        while pos[0] < len(s) and s[pos[0]] not in ',}':
+            pos[0] += 1
+        t = s[st:pos[0]].strip()
+        try:
+            return float(t) if any(c in t for c in '.eE') else int(t)
+        except ValueError:
+            return t
+
+    def block():
+        items = {}
+        while True:
+            ws()
+            if s[pos[0]] == '}':
+                pos[0] += 1
+                return items
+            st = pos[0]
+            name = ident()
+            ws()
+            if name and pos[0] < len(s) and s[pos[0]] == '{':
+                pos[0] += 1
+                items[name] = block()
+                continue
+            pos[0] = st
+            vals = [scalar()]
+            ws()
+            while s[pos[0]] == ',':
+                pos[0] += 1
+                vals.append(scalar())
+                ws()
+            if s[pos[0]] != '}':
+                raise ValueError('expected } at %d in parameter string' % pos[0])
+            pos[0] += 1
+            return vals[0] if len(vals) == 1 else vals
+
+    out = {}
+    while True:
+        ws()
+        if pos[0] >= len(s):
+            return out
+        name = ident()
+        ws()
+        if not name or pos[0] >= len(s) or s[pos[0]] != '{':
+            raise ValueError('expected name{ at %d in parameter string' % pos[0])
+        pos[0] += 1
+        out[name] = block()
+
+
+def flatten_params(d, out=None):
+    out = {} if out is None else out
+    for k, v in d.items():
+        if isinstance(v, dict):
+            flatten_params(v, out)
+        else:
+            out[k] = v
+    return out
+
+
+def apply_params(node, text):
+    """Set the node's knobs from a parameter string. Returns the number applied."""
+    top = parse_params(text.strip())
+    leaves = {}
+    for name, content in top.items():
+        if name.startswith('opendrt') and isinstance(content, dict):
+            flatten_params(content, leaves)
+    n = 0
+    for k, v in leaves.items():
+        if k not in node.knobs():
+            continue
+        kn = node[k]
+        if kn.Class() == 'Boolean_Knob':
+            kn.setValue(bool(v))
+        elif kn.Class() == 'Enumeration_Knob':
+            kn.setValue(str(v))
+        elif isinstance(v, list):
+            kn.setValue([float(x) for x in v])
+        elif isinstance(kn.value(), float):
+            kn.setValue(float(v))
+        else:
+            kn.setValue(str(v))
+        n += 1
+    return n
+
+
+# --- preset recognition and the automatic file name ---------------------------------
+def tcl_tokens(s):
+    return [next(g for g in m.groups() if g is not None)
+            for m in re.finditer(r'"((?:[^"\\]|\\.)*)"|\{([^{}]*)\}|(\S+)', s)]
+
+
+def preset_dicts(node, knob):
+    """[(label, {knob: value text})] from a 'knobs this {...}' pulldown."""
+    out, vals = [], node[knob].values()
+    for i in range(0, len(vals) - 1, 2):
+        m = re.search(r'knobs this \{(.*)\}\s*$', vals[i + 1], re.S)
+        if m:
+            toks = tcl_tokens(m.group(1))
+            out.append((vals[i].split('/', 1)[-1], dict(zip(toks[0::2], toks[1::2]))))
+    return out
+
+
+def knob_equals(k, text):
+    cls = k.Class()
+    try:
+        if cls == 'Boolean_Knob':
+            return bool(k.value()) == bool(int(float(text)))
+        if cls == 'Enumeration_Knob':
+            return k.value() == text or (text.lstrip('-').isdigit() and int(k.getValue()) == int(text))
+        if isinstance(k.value(), float):
+            return abs(k.value() - float(text)) <= 1e-6 * max(1.0, abs(float(text)))
+    except ValueError:
+        return False
+    return str(k.value()) == text
+
+
+def preset_match(node, knob):
+    for label, d in preset_dicts(node, knob):
+        if d and all(name in node.knobs() and knob_equals(node[name], v) for name, v in d.items()):
+            return label
+    return None
+
+
+def safe_name(s):
+    return re.sub(r'[^A-Za-z0-9._-]+', '', str(s).replace(' ', ''))
+
+
+def opendrt_filename(node, version, in_id, out_id, condition, shaper):
+    """Explicit, deterministic: OpenDRT-<ver>_<look|tonescale-hash|hash>_<in>_to_<out>_<condition>_<shaper><size>."""
+    look = preset_match(node, 'look_presets')
+    if look:
+        preset = safe_name(look)
+    else:
+        knobs = node['look_preset_knobs'].value().split() if 'look_preset_knobs' in node.knobs() else []
+        digest = uuid.uuid5(uuid.NAMESPACE_URL, ' '.join('%s=%s' % (k, pval(node[k])) for k in knobs if k in node.knobs())).hex[:8]
+        tn = preset_match(node, 'tn_presets')
+        preset = (safe_name(tn) + '-' + digest) if tn else digest
+    part = lambda i: i.split(':', 1)[-1].replace('|', '-')
+    return 'OpenDRT-%s_%s_%s_to_%s_%s_%s%d' % (version, preset, part(in_id), part(out_id), condition,
+                                               shaper['shortname'], int(shaper['cube_size']))
+
+
 def is_opendrt(node):
     return all(k in node.knobs() for k in ('look_preset_knobs', 'tn_Lp', 'eotf', 'display_gamut', 'in_gamut'))
 
@@ -289,16 +489,21 @@ def interop_ids(node, ns, log_input, shaper, measured):
     return in_id, in_fb, out_id, out_fb, (conform if abs((conform or 1.0) - 1.0) > 1e-9 else None)
 
 
-def describe_opendrt(nb, node, log_input, measured, shaper):
-    """Append <Model>, <Mastering> and <Interop> for an OpenDRT node. Returns a
-    conforming output scale to append as a Matrix node, or None."""
-    import re
+def opendrt_version(node):
     about = node['about_label'].value() if 'about_label' in node.knobs() else ''
     ver = re.search(r'v(\d+\.\d+\.\d+)', about)
-    ns = 'opendrt-v' + ('.'.join(ver.group(1).split('.')[:2]) if ver else 'unknown')
+    return ver.group(1) if ver else 'unknown'
+
+
+def describe_opendrt(nb, node, log_input, measured, shaper):
+    """Append <Model>, <Mastering> and <Interop> for an OpenDRT node. Returns a
+    dict: conform (output scale for a Matrix node or None), in_id, out_id,
+    condition, version, params (the parameter string)."""
+    version = opendrt_version(node)
+    ns = 'opendrt-v' + ('.'.join(version.split('.')[:2]) if version != 'unknown' else 'unknown')
     model = ET.SubElement(nb, 'Model', name='OpenDRT', node=node.name())
-    if ver:
-        model.set('version', ver.group(1))
+    if version != 'unknown':
+        model.set('version', version)
     if 'look_name' in node.knobs():
         model.set('look', node['look_name'].value())
     for elem, ids in OPENDRT_MODEL:
@@ -337,7 +542,8 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
     # viewing condition token in the FilmLight style: <class><wide?><peak nits>
     cls = {'dark': 'cinema', 'dim': 'video', 'bright': 'office'}.get(su, su)
     wide = 'wide' if cls != 'cinema' and gamut != 'Rec.709' else ''
-    ET.SubElement(mast, 'ViewingEnvironment', surround=su, condition='%s%s%d' % (cls, wide, int(round(lp))),
+    condition = '%s%s%d' % (cls, wide, int(round(lp)))
+    ET.SubElement(mast, 'ViewingEnvironment', surround=su, condition=condition,
                   ambient={'dark': 'theatre, dark surround', 'dim': 'video, 5 nit surround',
                            'bright': 'office or living room surround'}.get(su, ''))
     ET.SubElement(mast, 'CreativeWhite', whitepoint=cwp, limit=fmt(node['cwp_lm'].value()),
@@ -357,17 +563,20 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
         inter.set('outputConformNote', 'Matrix appended after the LUT3D so the output matches the published '
                   'definition: DCDM 48/52.37 headroom for g26_xyzd65_display, 1.0 = 100 cd/m2 for '
                   'ocio:lin_ciexyzd65_display')
-    return conform
+    params = opendrt_string(node, version)
+    ET.SubElement(nb, 'Params', syntax="name{key{value}group{key{'text'}}}; apply with Apply Params / Restore").text = params
+    return dict(conform=conform, in_id=in_id, out_id=out_id, condition=condition, version=version,
+                params=params, node=node)
 
 
 def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True):
     """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k).
-    measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None."""
+    measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None.
+    path may be a directory: the file is then named automatically (.clf).
+    Returns (lattice size, final path, ProcessList id)."""
     n, rows = read_cube(cube)
-    ctf = os.path.splitext(path)[1].lower() == '.ctf'
     tail = nodes[-1]
-    root = ET.Element('ProcessList', {'version': '2'} if ctf else {'compCLFversion': '3'})
-    root.set('id', '%s__%s' % (tail.name(), shaper['shortname']))
+    root = ET.Element('ProcessList')
     root.set('name', tail.name())
     ET.SubElement(root, 'InputDescriptor').text = (
         shaper['preset'] if log_input else 'Linear (%s shaper)' % shaper['preset'])
@@ -383,10 +592,26 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         e = ET.SubElement(ns, 'Node', {'class': node.Class(), 'name': node.name()})
         for name, val in knob_values(node):
             ET.SubElement(e, 'Knob', name=name).text = val
-    conform = None
+    desc = None
     for node in nodes:
         if is_opendrt(node):
-            conform = describe_opendrt(nb, node, log_input, measured, shaper) or conform
+            desc = describe_opendrt(nb, node, log_input, measured, shaper)
+    conform = desc['conform'] if desc else None
+    # file name and id
+    as_dir = os.path.isdir(path) or path.endswith(('/', os.sep))
+    if as_dir:
+        base = (opendrt_filename(desc['node'], desc['version'], desc['in_id'], desc['out_id'], desc['condition'], shaper)
+                if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size'])))
+        path = os.path.join(path, base + '.clf')
+    ctf = os.path.splitext(path)[1].lower() == '.ctf'
+    if ctf:
+        root.set('version', '2')
+    else:
+        root.set('compCLFversion', '3')
+    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}}' % (
+        pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1)
+    pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
+    root.set('id', pid)
     if embed_script:
         ET.SubElement(nb, 'Script').text = chain_script(nodes)
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
@@ -410,7 +635,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         ET.indent(root, '    ')
     arr.text = '\n' + '\n'.join('            ' + r for r in rows) + '\n        '
     ET.ElementTree(root).write(path, encoding='UTF-8', xml_declaration=True)
-    return n
+    return n, path.replace(os.sep, '/'), pid
 
 
 def bake_cube(generate_lut):
@@ -569,9 +794,9 @@ shaper['cube_size'] = int(shaper_node['cube_size'].value())
 log_input = bool(gen['log_input'].value())
 
 path = gen['file'].evaluate()
-if not path:
-    path = default_path(nodes[-1], shaper['shortname'])
-    gen['file'].setValue(path)
+if not path:   # empty: next to the script (or the temp dir), named automatically
+    root_name = nuke.root().name()
+    path = os.path.dirname(root_name) if root_name and root_name != 'Root' else tempfile.gettempdir()
 
 # chain output for neutral 0.18 and 1.0 (probe row 7: left half grey, right half white)
 shaper_node['probe'].setValue(True)
@@ -585,9 +810,10 @@ try:
     tmp = bake_cube(gen.node('GenerateLUT1'))
 finally:
     shaper_node['pattern'].setValue(False)
-size = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
-                 measured, bool(gen['embed_script'].value()))
+size, path, pid = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
+                            measured, bool(gen['embed_script'].value()))
 os.remove(tmp)
+gen['file'].setValue(path)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s)%s' % (
     os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'], fit_note))
 '''
@@ -663,8 +889,10 @@ OPENDRT_BAKE = COMMON + r'''
 SHAPER = __SHAPER__
 EXPR = __EXPR__
 n = nuke.thisNode()
-path = n['clf_file'].evaluate() or default_path(n, SHAPER['shortname'])
-n['clf_file'].setValue(path)
+path = n['clf_file'].evaluate()
+if not path:
+    root_name = nuke.root().name()
+    path = os.path.dirname(root_name) if root_name and root_name != 'Root' else tempfile.gettempdir()
 src = n.input(0)
 with nuke.thisParent():
     pat = nuke.nodes.CMSTestPattern(cube_size=SHAPER['cube_size'])
@@ -681,8 +909,10 @@ finally:
     n.setInput(0, src)
     for t in (lut, gw, inv, pat):
         nuke.delete(t)
-write_clf(path, tmp, SHAPER, [n], 'tetrahedral', False, measured, True)
+size, path, pid = write_clf(path, tmp, SHAPER, [n], 'tetrahedral', False, measured, True)
 os.remove(tmp)
+n['clf_file'].setValue(path)
+n['clf_params'].setValue(pid.split('clfbake{')[0])
 nuke.message('wrote %s' % path)
 '''.replace('__SHAPER__', repr(OPENDRT_SHAPER)).replace(
     '__EXPR__', repr([inverse_expr(c, OPENDRT_SHAPER) for c in 'rgb']))
@@ -691,6 +921,12 @@ OPENDRT_RESTORE = COMMON + r'''
 n = nuke.thisNode()
 done, sh = restore_apply(read_bake(n['clf_file'].evaluate()), [n])
 nuke.message('restored %s' % (', '.join(done) or 'nothing'))
+'''
+
+OPENDRT_APPLY = COMMON + r'''
+n = nuke.thisNode()
+count = apply_params(n, n['clf_params'].value())
+nuke.message('applied %d parameters' % count)
 '''
 
 
@@ -878,6 +1114,13 @@ def opendrt_knob_lines():
     g.addKnob(k)
     k = nuke.PyScript_Knob('restore_clf', 'Restore CLF', script(OPENDRT_RESTORE))
     k.setTooltip('Apply the parameters recorded in the CLF to this node.')
+    g.addKnob(k)
+    k = nuke.String_Knob('clf_params', 'params')
+    k.setTooltip("Parameter string, opendrt1_1{tonescale{tn_Lp{100}...}...}: every parameter of this node in a "
+                 "parseable form. Bake CLF fills it in (it is also the CLF's id); paste one and press Apply Params.")
+    g.addKnob(k)
+    k = nuke.PyScript_Knob('apply_params', 'Apply Params', script(OPENDRT_APPLY))
+    k.setTooltip('Set this node from the parameter string above.')
     g.addKnob(k)
     g.addKnob(nuke.Tab_Knob('endGroup_clf', '', nuke.TABENDGROUP))
     for n in nuke.allNodes():
