@@ -60,14 +60,14 @@ reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 explicit and deterministic, never random:
 
 ```
-OpenDRT-v<version>_<look>_<condition>__<input id>-to-<output id>__<size>.clf
-OpenDRT-v1.1.0_Standard_video100__lin_egamut2-to-g24_rec709__48.clf
-OpenDRT-v1.1.0_LowContrast-6f137a09_cinema1000__lin_ap1-to-pq_rec2020-p3lim-dw148__48.clf
+OpenDRT-v<version>_<look>_<condition>__<input id>__to__<output id>__<size>.clf
+OpenDRT-v1.1.0_Standard_video100__lin_egamut2__to__g24_rec709__48.clf
+OpenDRT-v1.1.0_LowContrast-6f137a09_cinema1000__lin_ap1__to__pq_rec2020-p3lim-dw148__48.clf
 ```
 
 Three sections separated by double underscores: the head (version, look,
 condition, single underscores; looks may contain hyphens), the input and
-output IDs joined by `-to-`, and the size. Interop IDs appear without namespace or `_scene`/`_display`, modifiers
+output IDs joined by `__to__`, and the size. Interop IDs appear without namespace or `_scene`/`_display`, modifiers
 joined with hyphens; the full IDs are in the metadata. `<size>` is the lattice size, prefixed by the shaper's short name
 when it is not the default T-LogE (`xlog48`), so bakes with different shapers
 do not overwrite each other.
