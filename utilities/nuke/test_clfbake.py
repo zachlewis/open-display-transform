@@ -593,97 +593,161 @@ gen['format'].setValue('clf')
 gen['levels'].setValue('full')
 gen['log_input'].setValue(False)
 
-# --- 14. structure "view + display": LUT3D in display-linear, XYZ tap, native encoding --
+# --- 14. linear outputs: code-value cube + exact decode nodes --------------------------
 def node_tags(path):
     return [e.tag + ('[' + e.get('style') + ']' if e.get('style') else '') + ('[half]' if e.get('halfDomain') else '')
             for e in ET.parse(path).getroot() if e.tag in ('Log', 'Range', 'LUT3D', 'Matrix', 'Exponent', 'FixedFunction', 'LUT1D')]
 
 
-def lattice_check(name, path, g, s, tol):
-    s['pattern'].setValue(True)
-    lin_l, live_l = sample(s, W, H), sample(g, W, H)
-    s['pattern'].setValue(False)
-    check(name, max_err(apply_clf(path, lin_l), live_l), tol)
+def t_npm(r, g, b, w):   # RGB -> XYZ from chromaticities (independent copy for the test)
+    cols = [(x / y, 1.0, (1.0 - x - y) / y) for x, y in (r, g, b)]
+    m = [[cols[j][i] for j in range(3)] for i in range(3)]
+    wx = (w[0] / w[1], 1.0, (1.0 - w[0] - w[1]) / w[1])
+    inv = t_inv(m)
+    s = [sum(inv[i][k] * wx[k] for k in range(3)) for i in range(3)]
+    return [[m[i][j] * s[j] for j in range(3)] for i in range(3)]
 
 
-# (a) SDR 2.4 Rec.709, peak 200: Exponent path; exact on the lattice
-gen['structure'].setValue('view + display')
-gen['file'].setValue(OUT + '/')
-gen['generate'].execute()
-clf_sp = gen['file'].value()
-print('status:', gen['status'].value())
-tags = node_tags(clf_sp)
-ok_sp = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'Exponent[basicRev]'] \
-    and ET.parse(clf_sp).getroot().find('Info/CLFBake/Interop').get('intermediate') == 'ocio:lin_ciexyzd65_display' \
-    and "structure{'view+display'}" in ET.parse(clf_sp).getroot().get('id')
-print('%s view+display SDR structure: %s' % ('PASS' if ok_sp else 'FAIL', tags))
-if not ok_sp:
-    failures.append('view+display SDR structure')
-assert drt['eotf'].value() == '2.4 Power - Rec.1886' and drt['clamp'].value(), 'node knobs must be restored after the bake'
-# warm-up: Nuke 15.1 -t can serve stale samples right after a bake that toggled
-# knobs on the chain (EOTF, clamp, bake gain); one sample per node refreshes it
-for n in (img, shaper, drt, gen):
-    n.sample('red', 0.5, 0.5)
-lattice_check('view+display SDR: lattice exact', clf_sp, gen, shaper, 2e-4)
-check('view+display SDR: CLF vs Nuke', max_err(apply_clf(clf_sp, lin), sample(gen, W, H)), IMAGE_TOL)
-# (b) PQ Rec.2020 (P3 limited) 1000 nit as CLF: half-domain LUT1D
-d4['eotf'].setValue('PQ'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000); d4['clamp'].setValue(True)
-g3['structure'].setValue('view + display'); g3['format'].setValue('clf'); g3['file'].setValue(OUT + '/')
-g3['generate'].execute()
-clf_pqs = g3['file'].value()
-tags = node_tags(clf_pqs)
-ok_pq = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'LUT1D[half]']
-print('%s view+display PQ CLF structure: %s' % ('PASS' if ok_pq else 'FAIL', tags))
-if not ok_pq:
-    failures.append('view+display PQ structure')
-lattice_check('view+display PQ: lattice (half-domain)', clf_pqs, g3, s3, 1e-3)
-check('view+display PQ: CLF vs Nuke', max_err(apply_clf(clf_pqs, lin), sample(g3, W, H)), IMAGE_TOL)
-# (c) the same as CTF 2.4 with Lin_TO_PQ: structure here, evaluation needs OCIO >= 2.4
-g3['format'].setValue('ctf'); g3['ocio'].setValue('2.4'); g3['file'].setValue(OUT + '/')
-g3['generate'].execute()
-ctf_pq = g3['file'].value()
-r = ET.parse(ctf_pq).getroot()
-tags = node_tags(ctf_pq)
-ok_ctf = r.get('version') == '2.4' and tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'FixedFunction[Lin_TO_PQ]']
-print('%s view+display PQ CTF 2.4 structure: version %s %s' % ('PASS' if ok_ctf else 'FAIL', r.get('version'), tags))
-if not ok_ctf:
-    failures.append('view+display PQ CTF structure')
-try:
-    check('view+display PQ CTF 2.4: vs Nuke', max_err(apply_clf(ctf_pq, lin), sample(g3, W, H)), IMAGE_TOL)
-except Exception as e:
-    print('   (CTF 2.4 Lin_TO_PQ not evaluated: OCIO %s cannot read it: %s)' % (ocio.__version__, str(e).splitlines()[0][:80]))
-# (d) HLG as CTF: standard BT.2100 inverse OOTF + OETF, checked against the standard
-#     formula on the node's display-linear output (the Nuke node itself applies only
-#     20.5% of the inverse OOTF, see README)
-d4['eotf'].setValue('HLG'); g3['ocio'].setValue('2.1'); g3['file'].setValue(OUT + '/')
-g3['generate'].execute()
-ctf_hlg = g3['file'].value()
-tags = node_tags(ctf_hlg)
-ok_hlg = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Matrix', 'Matrix', 'Range', 'FixedFunction[Rec2100SurroundRev]', 'LUT1D[half]']
-print('%s view+display HLG CTF structure: %s' % ('PASS' if ok_hlg else 'FAIL', tags))
-if not ok_hlg:
-    failures.append('view+display HLG structure')
-d4['eotf'].setValue('Linear'); d4['clamp'].setValue(False)
-disp_lin = sample(g3, W, H)                       # display-linear, 1.0 = 1000 cd/m2
-d4['eotf'].setValue('HLG'); d4['clamp'].setValue(True)
-nuke_hlg = sample(g3, W, H)
+def t_inv(m):
+    a, b, c = m[0]; d, e, f = m[1]; g, h, i = m[2]
+    det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    return [[(e * i - f * h) / det, (c * h - b * i) / det, (b * f - c * e) / det],
+            [(f * g - d * i) / det, (a * i - c * g) / det, (c * d - a * f) / det],
+            [(d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det]]
 
 
-def std_hlg(p):
-    v = [min(max(c, 0.0), 1.0) for c in p]
-    yd = 0.2627 * v[0] + 0.6780 * v[1] + 0.0593 * v[2]
-    k = yd ** ((1.0 - 1.2) / 1.2) if yd > 0 else 0.0
+def t_mul(m, v):
+    return [sum(m[i][k] * v[k] for k in range(3)) for i in range(3)]
+
+
+def t_mm(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def t_bradford(src, dst):
+    B = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]
+    def cones(xy):
+        X, Y, Z = xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]
+        return t_mul(B, [X, Y, Z])
+    s, d = cones(src), cones(dst)
+    return t_mm(t_inv(B), t_mm([[d[i] / s[i] if i == j else 0.0 for j in range(3)] for i in range(3)], B))
+
+
+XYT = {'Rec.709': ((0.64, 0.33), (0.30, 0.60), (0.15, 0.06), (0.3127, 0.3290)),
+       'P3-D65': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.3127, 0.3290)),
+       'Rec.2020 (P3 Limited)': ((0.708, 0.292), (0.170, 0.797), (0.131, 0.046), (0.3127, 0.3290)),
+       'P3-D60': ((0.680, 0.320), (0.265, 0.690), (0.150, 0.060), (0.32168, 0.33767))}
+
+
+def pq_dec100(c):
+    m1, m2, c1, c2, c3 = 2610 / 16384., 2523 / 32., 107 / 128., 2413 / 128., 2392 / 128.
+    v = min(max(c, 0.0), 1.0) ** (1.0 / m2)
+    return 100.0 * (max(v - c1, 0.0) / (c2 - c3 * v)) ** (1.0 / m1)
+
+
+def expected_linear(codes, eotf, gamut, lp, target):
+    """What the decode nodes must produce from the node's codes, 1.0 = 100 cd/m2."""
     out = []
-    for c in v:
-        e = c * k
-        out.append(math.sqrt(3.0 * e) if e <= 1.0 / 12.0 else 0.17883277 * math.log(12.0 * e - 0.28466892) + 0.55991073)
+    to_xyz = XYT[gamut] and t_npm(*XYT[gamut])
+    white = XYT[gamut][3]
+    cat = t_bradford(white, (0.3127, 0.3290)) if abs(white[0] - 0.3127) > 1e-6 else None
+    tgt = {'lin_rec709_display': 'Rec.709', 'lin_p3d65_display': 'P3-D65'}.get(target)
+    back = t_inv(t_npm(*XYT[tgt])) if tgt else None
+    for p in codes:
+        if eotf == 'PQ':
+            lin = [pq_dec100(c) for c in p]
+        else:
+            gamma = {'2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6, '2.2 Power - sRGB Display': 2.2}[eotf]
+            lin = [max(c, 0.0) ** gamma * lp / 100.0 for c in p]
+        xyz = t_mul(to_xyz, lin)
+        if cat:
+            xyz = t_mul(cat, xyz)
+        out.append(t_mul(back, xyz) if back else xyz)
     return out
 
 
-ref_hlg = [std_hlg(p) for p in disp_lin]
-check('view+display HLG CTF: vs standard BT.2100', max_err(apply_clf(ctf_hlg, lin), ref_hlg), IMAGE_TOL)
-print('   note: Nuke node HLG vs standard BT.2100 differs by max %.3f code (0.205 OOTF mix)' % max_err(nuke_hlg, ref_hlg))
-gen['structure'].setValue('baked'); g3['structure'].setValue('baked'); g3['format'].setValue('clf')
+def rel_err(a, b, scale):
+    return max(abs(p - q) for pa, pb in zip(a, b) for p, q in zip(pa, pb)) / scale
+
+
+# (a) SDR 2.4 Rec.709 at 200 nits -> lin_rec709_display: Exponent + Matrix, exact decode
+gen['output'].setValue('lin_rec709_display')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+clf_lin = gen['file'].value()
+print('status:', gen['status'].value())
+tags = node_tags(clf_lin)
+r = ET.parse(clf_lin).getroot()
+ok_a = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]', 'Matrix'] \
+    and r.find('Info/CLFBake/Interop').get('output') == 'lin_rec709_display' \
+    and r.find('Info/CLFBake/Interop').get('decoded') == 'true' and "output{'lin_rec709_display'}" in r.get('id') \
+    and '__to__lin_rec709__' in os.path.basename(clf_lin)
+print('%s decode SDR -> lin_rec709 structure: %s %s' % ('PASS' if ok_a else 'FAIL', tags, os.path.basename(clf_lin)))
+if not ok_a:
+    failures.append('decode SDR structure')
+for n in (img, shaper, drt, gen):
+    n.sample('red', 0.5, 0.5)
+live = sample(gen, W, H)                      # the node's codes
+exp = expected_linear(live, drt['eotf'].value(), 'Rec.709', drt['tn_Lp'].value(), 'lin_rec709_display')
+check('decode SDR: CLF vs decoded Nuke codes (rel to 2.0)', rel_err(apply_clf(clf_lin, lin), exp, 2.0), IMAGE_TOL)
+shaper['pattern'].setValue(True)
+lin_l, live_l = sample(shaper, W, H), sample(gen, W, H)
+shaper['pattern'].setValue(False)
+exp_l = expected_linear(live_l, drt['eotf'].value(), 'Rec.709', drt['tn_Lp'].value(), 'lin_rec709_display')
+check('decode SDR: lattice exact (rel)', rel_err(apply_clf(clf_lin, lin_l), exp_l, 2.0), 1e-4)
+# (b) PQ Rec.2020 (P3 limited) 1000 nit -> lin_ciexyzd65_display, half-domain decode, CLF
+d4['eotf'].setValue('PQ'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000); d4['clamp'].setValue(True)
+g3['output'].setValue('lin_ciexyzd65_display'); g3['format'].setValue('clf'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+clf_pql = g3['file'].value()
+tags = node_tags(clf_pql)
+ok_b = tags == ['Log[cameraLinToLog]', 'LUT3D', 'LUT1D[half]', 'Matrix'] and '__to__lin_ciexyzd65' in os.path.basename(clf_pql)
+print('%s decode PQ -> lin_ciexyzd65 structure: %s' % ('PASS' if ok_b else 'FAIL', tags))
+if not ok_b:
+    failures.append('decode PQ structure')
+for n in (img, s3, d4, g3):
+    n.sample('red', 0.5, 0.5)
+live4 = sample(g3, W, H)
+exp4 = expected_linear(live4, 'PQ', 'Rec.2020 (P3 Limited)', 1000, 'lin_ciexyzd65_display')
+check('decode PQ: CLF vs decoded Nuke codes (rel to 10)', rel_err(apply_clf(clf_pql, lin), exp4, 10.0), IMAGE_TOL)
+# (c) same as CTF 2.4: PQ_TO_Lin
+g3['format'].setValue('ctf'); g3['ocio'].setValue('2.4'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+ctf_pql = g3['file'].value()
+r = ET.parse(ctf_pql).getroot()
+tags = node_tags(ctf_pql)
+ok_c = r.get('version') == '2.4' and tags == ['Log[cameraLinToLog]', 'LUT3D', 'FixedFunction[PQ_TO_Lin]', 'Matrix']
+print('%s decode PQ CTF 2.4 structure: version %s %s' % ('PASS' if ok_c else 'FAIL', r.get('version'), tags))
+if not ok_c:
+    failures.append('decode PQ CTF structure')
+g3['format'].setValue('clf'); g3['ocio'].setValue('2.1')
+# (d) P3-D60 2.6 container -> lin_p3d65_display: Bradford D60 -> D65 inside the Matrix
+d4['eotf'].setValue('2.6 Power DCI'); d4['display_gamut'].setValue('P3-D60'); d4['tn_Lp'].setValue(100)
+g3['output'].setValue('lin_p3d65_display'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+clf_d60 = g3['file'].value()
+r = ET.parse(clf_d60).getroot()
+adapt = r.find('Info/CLFBake/Interop').get('adaptation') or ''
+ok_d = node_tags(clf_d60) == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]', 'Matrix'] and adapt.startswith('Bradford P3-D60')
+print('%s decode P3-D60 -> lin_p3d65: adaptation "%s"' % ('PASS' if ok_d else 'FAIL', adapt))
+if not ok_d:
+    failures.append('decode P3-D60 structure')
+for n in (img, s3, d4, g3):
+    n.sample('red', 0.5, 0.5)
+live4 = sample(g3, W, H)
+exp4 = expected_linear(live4, '2.6 Power DCI', 'P3-D60', 100, 'lin_p3d65_display')
+check('decode P3-D60: CLF vs decoded+adapted codes (rel to 1)', rel_err(apply_clf(clf_d60, lin), exp4, 1.0), IMAGE_TOL)
+# (e) HLG cannot be decoded: falls back to codes with a note
+d4['eotf'].setValue('HLG'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000)
+g3['output'].setValue('lin_ciexyzd65_display'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+ok_e = 'HLG cannot be decoded' in g3['status'].value() and node_tags(g3['file'].value()) == ['Log[cameraLinToLog]', 'LUT3D'] \
+    and 'hlg_rec2020' in os.path.basename(g3['file'].value())
+print('%s decode HLG falls back to codes: %s' % ('PASS' if ok_e else 'FAIL', os.path.basename(g3['file'].value())))
+if not ok_e:
+    failures.append('decode HLG fallback')
+gen['output'].setValue('display codes'); g3['output'].setValue('display codes')
+
 
 print('outputs in', OUT)
 if failures:

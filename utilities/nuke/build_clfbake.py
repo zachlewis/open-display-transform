@@ -136,7 +136,7 @@ def read_cube(path):
 CSP_PRELUT = 4096
 
 
-# --- display encoding as native nodes (structure "view + display") ---------------------
+# --- linear outputs: exact decode nodes after the code-value cube ---------------------
 def mat_inv(m):
     a, b, c = m[0]; d, e, f = m[1]; g, h, i = m[2]
     det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
@@ -160,20 +160,29 @@ def npm(r, g, b, w):
 
 
 IDENTITY = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+D65 = (0.3127, 0.3290)
+BRADFORD = [[0.8951, 0.2664, -0.1614], [-0.7502, 1.7135, 0.0367], [0.0389, -0.0685, 1.0296]]
 
 
-def pq_encode(nits100):
+def mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)] for i in range(3)]
+
+
+def bradford(src_xy, dst_xy):
+    """von Kries adaptation in Bradford cone space, XYZ(src white) -> XYZ(dst white)."""
+    def cones(xy):
+        X, Y, Z = xy[0] / xy[1], 1.0, (1.0 - xy[0] - xy[1]) / xy[1]
+        return [sum(BRADFORD[i][k] * v for k, v in enumerate((X, Y, Z))) for i in range(3)]
+    s, d = cones(src_xy), cones(dst_xy)
+    diag = [[d[i] / s[i] if i == j else 0.0 for j in range(3)] for i in range(3)]
+    return mat_mul(mat_inv(BRADFORD), mat_mul(diag, BRADFORD))
+
+
+def pq_eotf_nits100(code):
+    """PQ code value -> linear with 1.0 = 100 cd/m2 (OCIO's display convention)."""
     m1, m2, c1, c2, c3 = 2610 / 16384., 2523 / 32., 107 / 128., 2413 / 128., 2392 / 128.
-    y = max(nits100, 0.0) / 100.0
-    ym = y ** m1
-    return min(1.0, ((c1 + c2 * ym) / (1.0 + c3 * ym)) ** m2)
-
-
-def hlg_oetf(e):
-    a, b, c = 0.17883277, 1.0 - 4.0 * 0.17883277, 0.5 - 0.17883277 * math.log(4.0 * 0.17883277)
-    if e <= 1.0 / 12.0:
-        return math.sqrt(3.0 * max(e, 0.0))
-    return a * math.log(12.0 * e - b) + c
+    v = min(max(code, 0.0), 1.0) ** (1.0 / m2)
+    return 100.0 * (max(v - c1, 0.0) / (c2 - c3 * v)) ** (1.0 / m1)
 
 
 def half_domain_values(fn):
@@ -211,49 +220,44 @@ def add_range(root, lo_in, hi_in, lo_out, hi_out, note, no_clamp=False):
         ET.SubElement(e, tag).text = repr(float(val))
 
 
-def add_display_nodes(root, display, fixed_ok):
-    """After a LUT3D that outputs display-linear container RGB with 1.0 = peak
-    luminance (OpenDRT with EOTF Linear, clamp off): the CIE XYZ D65 tap, then
-    the display colorspace as native nodes. Returns the CTF version needed."""
-    eotf, gamut, lp, clamp = display['eotf'], display['gamut'], float(display['lp']), display['clamp']
-    gain = float(display.get('gain', 1.0))
-    M = IDENTITY if gamut == "X'Y'Z'" else npm(*XY[gamut])
-    add_matrix(root, mat_scale(M, lp / 100.0 / gain),
-               'view transform output: CIE XYZ D65 display-referred, 1.0 = 100 cd/m2 (ocio:lin_ciexyzd65_display)'
-               + ('; the LUT3D is stored x%g' % gain if gain != 1.0 else ''))
-    if eotf == 'Linear':
-        return '2'
-    inv = mat_inv(M)
-    version = '2'
+LINEAR_TARGETS = {'lin_ciexyzd65_display': ('ocio:lin_ciexyzd65_display', None),
+                  'lin_rec709_display': ('lin_rec709_display', 'Rec.709'),
+                  'lin_p3d65_display': ('lin_p3d65_display', 'P3-D65')}
+
+
+def add_decode_nodes(root, dec, fixed_ok):
+    """After the LUT3D, which holds the node's display code values exactly as
+    baked: exact parametric decode to a linear display-referred target with
+    1.0 = 100 cd/m2. Returns (CTF version needed, adaptation note or None)."""
+    eotf, gamut, lp = dec['eotf'], dec['gamut'], float(dec['lp'])
+    version, scale = '2', lp / 100.0
     if eotf == 'PQ':
-        add_matrix(root, inv, 'display colorspace: XYZ -> %s, 1.0 = 100 cd/m2' % gamut)
-        if clamp:
-            add_range(root, 0.0, 100.0, 0.0, 100.0, 'clamp 0..10000 cd/m2 (the node clamps before the EOTF)')
-        if fixed_ok and display.get('pq_fixed'):
-            ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='Lin_TO_PQ')
+        if fixed_ok and dec.get('pq_fixed'):
+            ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='PQ_TO_Lin')
             version = '2.4'
         else:
             lut = ET.SubElement(root, 'LUT1D', inBitDepth='32f', outBitDepth='32f', halfDomain='true')
-            ET.SubElement(lut, 'Description').text = 'ST 2084 PQ inverse EOTF, input 1.0 = 100 cd/m2'
+            ET.SubElement(lut, 'Description').text = 'ST 2084 PQ EOTF, output 1.0 = 100 cd/m2'
             ET.SubElement(lut, 'Array', dim='65536 1').text = '\n' + '\n'.join(
-                '            ' + v for v in half_domain_values(pq_encode)) + '\n        '
-    elif eotf == 'HLG':
-        add_matrix(root, mat_scale(inv, 0.1), 'display colorspace: XYZ -> %s, 1.0 = 1000 cd/m2' % gamut)
-        if clamp:
-            add_range(root, 0.0, 1.0, 0.0, 1.0, 'clamp 0..1000 cd/m2 (the node clamps before the EOTF)')
-        ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='Rec2100SurroundRev', params='1.2')
-        lut = ET.SubElement(root, 'LUT1D', inBitDepth='32f', outBitDepth='32f', halfDomain='true')
-        ET.SubElement(lut, 'Description').text = 'BT.2100 HLG OETF (after the inverse OOTF, system gamma 1.2)'
-        ET.SubElement(lut, 'Array', dim='65536 1').text = '\n' + '\n'.join(
-            '            ' + v for v in half_domain_values(hlg_oetf)) + '\n        '
-    else:
+                '            ' + v for v in half_domain_values(pq_eotf_nits100)) + '\n        '
+        scale = 1.0
+    elif eotf != 'Linear':
         gamma = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
-        add_matrix(root, mat_scale(inv, 100.0 / lp), 'display colorspace: XYZ -> %s, 1.0 = peak luminance' % gamut)
-        if clamp:
-            add_range(root, 0.0, 1.0, 0.0, 1.0, 'clamp 0..peak (the node clamps before the EOTF)')
-        ex = ET.SubElement(root, 'Exponent', inBitDepth='32f', outBitDepth='32f', style='basicRev')
+        ex = ET.SubElement(root, 'Exponent', inBitDepth='32f', outBitDepth='32f', style='basicFwd')
         ET.SubElement(ex, 'ExponentParams', exponent=repr(gamma))
-    return version
+    # container RGB (1.0 = peak) -> XYZ (1.0 = 100 cd/m2) -> [Bradford to D65] -> target RGB
+    to_xyz = IDENTITY if gamut == "X'Y'Z'" else npm(*XY[gamut])
+    m = mat_scale(to_xyz, scale)
+    note = None
+    white = XY[gamut][3] if gamut in XY else D65
+    if gamut != "X'Y'Z'" and (abs(white[0] - D65[0]) > 1e-6 or abs(white[1] - D65[1]) > 1e-6):
+        m = mat_mul(bradford(white, D65), m)
+        note = 'Bradford %s white (%g, %g) -> D65, as OCIO display colorspaces do' % (gamut, white[0], white[1])
+    target_id, target_gamut = LINEAR_TARGETS[dec['target']]
+    if target_gamut:
+        m = mat_mul(mat_inv(npm(*XY[target_gamut])), m)
+    add_matrix(root, m, 'decode to %s, 1.0 = 100 cd/m2%s' % (target_id, '; ' + note if note else ''))
+    return version, note
 
 
 def bake_csp(path, clf_path, n, shaper, log_input, meta_lines):
@@ -658,7 +662,7 @@ def interop_ids(node, ns, log_input, shaper, measured):
     gam, eotf, cont = node['in_gamut'].value(), node['eotf'].value(), node['display_gamut'].value()
     cwp, lp = node['cwp'].value(), node['tn_Lp'].value()
     g = GAMUT_SHORT.get(gam, 'unknown')
-    split_linear = bool(shaper.get('split')) and eotf == 'Linear'   # view+display with no display part: XYZ out
+    target = shaper.get('target')   # a linear decode target replaces the display encoding as the output
     if log_input:
         if shaper['shortname'] == 'acescct' and g == 'ap1':
             in_id, in_fb = 'ocio:acescct_ap1_scene', None
@@ -674,9 +678,9 @@ def interop_ids(node, ns, log_input, shaper, measured):
         in_id = '%s:%s|codes%gto%g' % (ns, base, c0, c1)
     base = '%s_%s_display' % (EOTF_SHORT[eotf], CONTAINER_SHORT[cont])
     base = OUT_ALIAS.get(base, base)
-    if split_linear:
-        base = 'ocio:lin_ciexyzd65_display'
-    conform = PUBLISHED_OUT.get(base)
+    if target:
+        base = LINEAR_TARGETS[target][0]
+    conform = None if target else PUBLISHED_OUT.get(base)
     if conform == 'lp/100':
         conform = lp / 100.0
     mods = []
@@ -688,7 +692,7 @@ def interop_ids(node, ns, log_input, shaper, measured):
         mods.append('dw%d' % int(round(to_nits(sum(measured[1]) / 3.0, eotf, lp))))
     if not node['clamp'].value():
         mods.append('clamp0')
-    levels = ('L' if (log_input and shaper.get('legal_in')) else 'E') + ('L' if shaper.get('legal_out') else 'E')
+    levels = ('L' if (log_input and shaper.get('legal_in')) else 'E') + ('L' if (shaper.get('legal_out') and not target) else 'E')
     if log_input or levels != 'EE':
         mods.append(levels)
     published = base in PUBLISHED_OUT
@@ -781,7 +785,7 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
 
 
 def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None, embed_script=True, fmt='clf',
-              display=None):
+              decode=None):
     """shaper: dict with preset, shortname, cube_size, gs go ls lo lb sl (and xlog w0 o x0 y0 k).
     measured: ((r,g,b) chain output for neutral 0.18, same for 1.0) or None.
     path may be a directory: the file is then named automatically with `fmt`
@@ -811,8 +815,8 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         if is_opendrt(node):
             desc = describe_opendrt(nb, node, log_input, measured, shaper)
     conform = desc['conform'] if desc else None
-    if display and display['eotf'] == 'Linear':
-        conform = None   # the XYZ tap matrix already puts 1.0 at 100 cd/m2
+    if decode:
+        conform = None   # the decode matrix puts 1.0 at 100 cd/m2 itself
     # file name and id
     as_dir = os.path.isdir(path) or path.endswith(('/', os.sep))
     if as_dir:
@@ -828,9 +832,9 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
     legal_in, legal_out = bool(log_input and shaper.get('legal_in')), bool(shaper.get('legal_out'))
     levels = ('L' if legal_in else 'E') + ('L' if legal_out else 'E')
-    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}levels{%s}structure{%s}%s}' % (
+    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}levels{%s}output{%s}%s}' % (
         pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1,
-        pq(levels), pq('view+display' if display else 'baked'), 'codes{%r,%r}' % (c0, c1) if ranged else '')
+        pq(levels), pq(decode['target'] if decode else 'display codes'), 'codes{%r,%r}' % (c0, c1) if ranged else '')
     pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
     root.set('id', pid)
     csp_path = None
@@ -868,16 +872,18 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
             ET.SubElement(rng, tag).text = repr(val)
     lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
-    if display:
-        ET.SubElement(lut, 'Description').text = ('output: display-linear %s x%g, 1.0/%g = peak luminance, unclamped'
-                                                  % (display['gamut'], display.get('gain', 1.0), display.get('gain', 1.0)))
-        needed = add_display_nodes(root, display, fixed_ok=(ext == '.ctf'))
+    if decode:
+        ET.SubElement(lut, 'Description').text = 'output: %s display code values, as the node makes them' % decode['gamut']
+        needed, note = add_decode_nodes(root, decode, fixed_ok=(ext == '.ctf'))
         if ext == '.ctf' and needed == '2.4':
             root.set('version', '2.4')
         inter = nb.find('Interop')
         if inter is not None:
-            inter.set('structure', 'view+display')
-            inter.set('intermediate', 'ocio:lin_ciexyzd65_display')
+            inter.set('decoded', 'true')
+            if note:
+                inter.set('adaptation', note)
+        root.find('OutputDescriptor').text = '%s (1.0 = 100 cd/m2), decoded from %s %s' % (
+            LINEAR_TARGETS[decode['target']][0], decode['gamut'], decode['eotf'])
     if conform is not None:
         m = ET.SubElement(root, 'Matrix', inBitDepth='32f', outBitDepth='32f')
         ET.SubElement(m, 'Description').text = 'conform output scale %r (see Info/CLFBake/Interop)' % conform
@@ -1099,24 +1105,20 @@ shaper['cube_size'] = int(shaper_node['cube_size'].value())
 shaper['legal_in'] = gen['levels'].value() in ('legal in', 'legal in and out')
 shaper['legal_out'] = gen['levels'].value() in ('legal out', 'legal in and out')
 
-# structure "view + display": bake the OpenDRT node with EOTF Linear and clamp
-# off, so the LUT3D holds display-linear RGB, and write the display encoding
-# as native nodes behind a CIE XYZ D65 tap
-display, split_note = None, ''
+# linear outputs: the cube stays code-to-code (best interpolation); exact decode
+# nodes after it reach lin_ciexyzd65 / lin_rec709 / lin_p3d65 display-referred
+decode, decode_note = None, ''
 drt_node = next((x for x in nodes if is_opendrt(x)), None)
-if gen['structure'].value() == 'view + display':
+target = gen['output'].value()
+if target != 'display codes':
     if drt_node is None:
-        split_note = ', view+display needs an OpenDRT node: baked'
+        decode_note = ', %s needs an OpenDRT node: display codes' % target
+    elif drt_node['eotf'].value() == 'HLG':
+        decode_note = ', HLG cannot be decoded (the node applies 20.5%% of the inverse OOTF, not a standard operator): display codes'
     else:
-        fp = gen['file'].evaluate()
-        want_ext = os.path.splitext(fp)[1].lower() if fp and not (os.path.isdir(fp) or fp.endswith('/')) else '.' + gen['format'].value()
-        if drt_node['eotf'].value() == 'HLG' and want_ext != '.ctf':
-            split_note = ', HLG view+display needs CTF (FixedFunction OOTF): baked'
-        else:
-            display = dict(eotf=drt_node['eotf'].value(), gamut=drt_node['display_gamut'].value(),
-                           lp=drt_node['tn_Lp'].value(), clamp=bool(drt_node['clamp'].value()),
-                           pq_fixed=(gen['ocio'].value() == '2.4'))
-            shaper['split'] = True
+        decode = dict(eotf=drt_node['eotf'].value(), gamut=drt_node['display_gamut'].value(),
+                      lp=drt_node['tn_Lp'].value(), target=target, pq_fixed=(gen['ocio'].value() == '2.4'))
+        shaper['target'] = target
 log_input = bool(gen['log_input'].value())
 
 path = gen['file'].evaluate()
@@ -1132,27 +1134,17 @@ try:
 finally:
     shaper_node['probe'].setValue(False)
 shaper_node['pattern'].setValue(True)
-saved = (drt_node['eotf'].value(), drt_node['clamp'].value()) if display else None
 try:
-    if display:
-        drt_node['eotf'].setValue('Linear')
-        drt_node['clamp'].setValue(False)
-        display['gain'] = 16384.0
-        gen['bake_gain'].setValue(display['gain'])
     tmp = bake_cube(gen.node('GenerateLUT1'))
 finally:
     shaper_node['pattern'].setValue(False)
-    gen['bake_gain'].setValue(1.0)
-    if saved:
-        drt_node['eotf'].setValue(saved[0])
-        drt_node['clamp'].setValue(saved[1])
 size, path, pid = write_clf(path, tmp, shaper, nodes, gen['interpolation'].value(), log_input,
-                            measured, bool(gen['embed_script'].value()), gen['format'].value(), display)
+                            measured, bool(gen['embed_script'].value()), gen['format'].value(), decode)
 os.remove(tmp)
 gen['file'].setValue(path)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s%s)%s%s' % (
     os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'],
-    ', view+display' if display else '', fit_note, split_note))
+    ', -> ' + target if decode else '', fit_note, decode_note))
 '''
 
 
@@ -1404,11 +1396,7 @@ def build_generate():
     g = nuke.nodes.Group(name='CLFGenerate')
     g.begin()
     inp = nuke.nodes.Input(name='Input1')
-    # GenerateLUT writes six decimals; display-linear bakes are scaled up by
-    # bake_gain (2^14) here and divided back out in the CLF's first Matrix
-    gain = nuke.nodes.Multiply(name='BakeGain', inputs=[inp])
-    gain['value'].setExpression('parent.bake_gain')
-    lut = nuke.nodes.GenerateLUT(name='GenerateLUT1', inputs=[gain])
+    lut = nuke.nodes.GenerateLUT(name='GenerateLUT1', inputs=[inp])
     lut['file_type'].setValue('.cube')
     nuke.nodes.Output(name='Output1', inputs=[inp])
     g.end()
@@ -1426,18 +1414,19 @@ def build_generate():
     k = nuke.Enumeration_Knob('interpolation', 'interpolation', ['tetrahedral', 'trilinear'])
     k.setTooltip('Interpolation recorded in the LUT3D node.')
     g.addKnob(k)
-    k = nuke.Enumeration_Knob('structure', 'structure', ['baked', 'view + display'])
-    k.setTooltip('baked: the LUT3D holds everything up to output code values.\n'
-                 'view + display: the LUT3D holds the OpenDRT render as display-linear RGB (baked with EOTF '
-                 'Linear and clamp off), followed by a Matrix to CIE XYZ D65 (1.0 = 100 cd/m2, the OCIO '
-                 'display interchange) and the display colorspace as native nodes: Matrix, Range clamp, '
-                 'Exponent for power EOTFs, PQ as Lin_TO_PQ (CTF 2.4) or a half-domain LUT1D, HLG as the '
-                 'standard BT.2100 inverse OOTF (FixedFunction, CTF only) plus OETF LUT1D. Needs an OpenDRT '
-                 'node in the chain.')
+    k = nuke.Enumeration_Knob('output', 'output', ['display codes', 'lin_ciexyzd65_display', 'lin_rec709_display',
+                                                   'lin_p3d65_display'])
+    k.setTooltip('display codes: the file ends in the node\'s display code values (the cube itself).\n'
+                 'lin_*: the cube is still baked code-to-code (best use of the lattice), then exact decode '
+                 'nodes follow: Exponent basicFwd for power EOTFs, PQ as a half-domain LUT1D or the PQ_TO_Lin '
+                 'FixedFunction (ctf target 2.4), and one Matrix: container RGB -> CIE XYZ D65 at 1.0 = 100 '
+                 'cd/m2, Bradford-adapted from the container white to D65 when that white is not D65 (P3-D60, '
+                 'P3-DCI; as OCIO display colorspaces do), then to the target primaries. Needs an OpenDRT node; '
+                 'HLG cannot be decoded (the node applies 20.5% of the inverse OOTF).')
     g.addKnob(k)
     k = nuke.Enumeration_Knob('ocio', 'ctf target', ['2.1', '2.4'])
-    k.setTooltip('Which OCIO/CTF features a CTF may use. 2.4 enables the Lin_TO_PQ FixedFunction for PQ; '
-                 '2.1 writes PQ as a half-domain LUT1D, which Nuke 15 and 16 (OCIO 2.2 and 2.3) can read.')
+    k.setTooltip('Which OCIO/CTF features a CTF may use. 2.4 enables the PQ_TO_Lin FixedFunction for PQ '
+                 'decoding; 2.1 writes a half-domain LUT1D, which Nuke 15 and 16 (OCIO 2.2 and 2.3) can read.')
     g.addKnob(k)
     k = nuke.Enumeration_Knob('levels', 'levels', ['full', 'legal in', 'legal out', 'legal in and out'])
     k.setTooltip('Code value range of the file\'s input and output. full: 0-1 as the chain produces (what the '
@@ -1476,10 +1465,6 @@ def build_generate():
                  'upstream CLFShaper and this node, and restore the shaper. Baking again reproduces the CLF.')
     g.addKnob(k)
     g.addKnob(nuke.Text_Knob('status', ' ', ''))
-    k = nuke.Double_Knob('bake_gain', 'bake gain')
-    k.setValue(1.0)
-    k.setFlag(nuke.INVISIBLE)
-    g.addKnob(k)
     g.addKnob(nuke.Tab_Knob('About'))
     g.addKnob(nuke.Text_Knob('about', ' ', ABOUT % ('CLFGenerate',
         'Bakes everything between the upstream CLFShaper and this node into a CLF or CTF: a parametric '

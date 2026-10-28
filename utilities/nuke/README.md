@@ -37,8 +37,8 @@ chain as linear.
 | file | Output path. A `.ctf` extension writes CTF instead of CLF. A directory, or empty (the script's directory), names the file automatically; see below. |
 | format | `clf` (default), `ctf`, or `csp` for automatically named files. An explicit extension on a file path wins. |
 | interpolation | Recorded in the LUT3D node. Tetrahedral by default. |
-| structure | `baked` (default): the LUT3D holds everything up to output code values. `view + display`: the OCIO split, see below. |
-| ctf target | `2.1` (default) or `2.4`: which OCIO features a CTF may use. 2.4 writes PQ as the `Lin_TO_PQ` FixedFunction; 2.1 writes a half-domain LUT1D, which Nuke 15 and 16 (OCIO 2.2 and 2.3) can read. |
+| output | `display codes` (default): the file ends in the node's display code values. `lin_ciexyzd65_display`, `lin_rec709_display`, `lin_p3d65_display`: exact decode nodes after the same code-value cube; see Linear outputs below. |
+| ctf target | `2.1` (default) or `2.4`: which OCIO features a CTF may use. 2.4 writes the PQ decode as the `PQ_TO_Lin` FixedFunction; 2.1 writes a half-domain LUT1D, which Nuke 15 and 16 (OCIO 2.2 and 2.3) can read. |
 | levels | `full` (default): 0 to 1 code values in and out, which is what OCIO and the CIF display IDs expect. `legal in`, `legal out`, `legal in and out`: 64 to 940 on 1023, written as **unclamped `noClamp` Range nodes first and/or last in the CLF**, so deleting the first or the last node turns a legal-legal file into full-legal or legal-full exactly. Legal in applies to log input only; a linear input has no video range. The levels appear as an `LL` / `LE` / `EL` / `EE` modifier on the output ID and the CICP `fullRange` flag follows. OCIO applies these nodes, it does not optimise them away, which is why `full` stays the default. |
 | log input | Omit the Log node and declare the shaper's log encoding as the input, the way the released OpenDRT config consumes its cubes. Off by default: the shaper is embedded and the CLF takes linear input. |
 | embed node script | Also store the baked nodes as a Nuke script in the CLF so From CLF can rebuild them. On by default; the structured metadata is written regardless. |
@@ -60,45 +60,46 @@ the CLF exactly, like any preset. Measured on OpenDRT with inputs up to 8192
 linear, T-LogE clamps at 3.0e-2 worst case regardless of size; the fitted XLog
 reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 
-**Structure `view + display`.** The OCIO decomposition of a display pipeline
-into a view transform that ends in CIE XYZ D65 and a display colorspace that
-encodes it. CLFGenerate bakes the OpenDRT node with its EOTF temporarily set
-to Linear and its clamp off (restored afterwards), so the LUT3D holds the
-render as display-linear RGB in the chosen container, with the node's own
-gamut limiting and creative-white handling intact. Then native nodes follow:
+**Linear outputs.** The `output` menu can end the file in a linear
+display-referred space instead of display code values: `lin_ciexyzd65_display`
+(OpenColorIO's CIE XYZ D65 display interchange), `lin_rec709_display` or
+`lin_p3d65_display`, all with 1.0 = 100 cd/m². The cube is still baked
+code-value to code-value, exactly as for `display codes`, because that is the
+best use of the lattice: interpolation is linear in whatever the cube stores,
+and a log-in, code-out mapping is nearly straight, whereas a cube holding
+linear light misses wherever the DRT curves and the encode then stretches the
+misses in the shadows. Measured on the test chain, a linear-light cube doubled
+the SDR off-lattice error (1.6e-2 against 7.8e-3) and cost 1.5x for PQ. So the
+linear targets are reached by exact decode nodes appended after the cube:
 
 ```
-[Log shaper] [Range codes] LUT3D
-  Matrix   container RGB -> CIE XYZ D65, 1.0 = 100 cd/m2      <- ocio:lin_ciexyzd65_display
-  Matrix   XYZ -> container RGB (scaled for the encoding)
-  Range    the node's 0..1 clamp, at the right level for the encoding
-  Exponent basicRev 2.2 / 2.4 / 2.6              (power EOTFs)
-  LUT1D halfDomain  or  FixedFunction Lin_TO_PQ   (PQ; FixedFunction with ctf target 2.4)
-  FixedFunction Rec2100SurroundRev 1.2 + LUT1D halfDomain OETF   (HLG, CTF only)
-  [Matrix conform] [Range legal]
+[Log shaper] [Range codes] LUT3D (display code values, as baked)
+  Exponent basicFwd 2.2 / 2.4 / 2.6                   power EOTFs
+  LUT1D halfDomain  or  FixedFunction PQ_TO_Lin        PQ (FixedFunction with ctf target 2.4)
+  Matrix   container RGB -> XYZ (1.0 = 100 cd/m2) -> [Bradford to D65] -> target primaries
 ```
 
-The two matrices cancel numerically; the point is the explicit XYZ tap, so a
-consumer can take the LUT3D plus the first Matrix as a view transform into
-OCIO's `cie_xyz_d65_interchange` and let its own display colorspaces encode.
-That is valid within the same container: the baked XYZ still carries the
-container's gamut clip and white handling. With EOTF Linear the display part is
-omitted and the file ends at XYZ. HLG in this structure is the *standard*
-BT.2100 inverse OOTF (system gamma 1.2) plus OETF, which is what the OpenDRT
-DCTL does; the Nuke node applies its inverse OOTF through an Expression with
-`mix 0.205`, that is 20.5% of it, so the Nuke node's own HLG output differs
-from the standard, and from the DCTL, by up to 0.118 code on the test chain.
-The harness therefore checks the HLG CTF against the standard formula applied
-to the node's display-linear output, not against the node's HLG output. HLG
-needs CTF because the inverse OOTF has channel crosstalk and CLF has no
-FixedFunction.
+The one Matrix folds three things: the container's RGB-to-XYZ, a Bradford
+adaptation from the container white to D65 when that white is not D65
+(P3-D60 and P3-DCI; the rule OCIO's own display colorspaces follow, recorded as
+`adaptation` on the Interop element), and the target's XYZ-to-RGB. The
+creative white is content, not container, and is left alone: a D60 sim stays
+warm in a D65 space, as intended. X'Y'Z' is absolute colorimetry and gets no
+adaptation. The clamp is already inside the codes, so the linear values are
+exactly what the node's codes mean. The decode is exact: lattice points
+reproduce to 2e-5 relative for SDR; PQ through the half-domain LUT1D is within
+half-float precision, and the CTF 2.4 `PQ_TO_Lin` file agrees with it to
+3.4e-4 under OpenColorIO 2.5. A consumer who wants another display encoding
+appends their own display colorspace from the linear target, the OCIO way.
 
-Precision: GenerateLUT writes six decimals, which quantises display-linear
-values to 1e-6, and a 2.4 power turns that into 1.4e-3 near black. CLFGenerate
-therefore bakes display-linear through an internal gain of 2^14 and divides it
-out in the first Matrix, exact in float; measured lattice error is 6e-6 for SDR
-and 7e-5 for PQ through the half-domain LUT1D. The CTF 2.4 `Lin_TO_PQ` file
-agrees with the half-domain CLF to 3.4e-4 under OpenColorIO 2.5.
+HLG cannot be decoded. The OpenDRT Nuke node applies its HLG inverse OOTF
+through an Expression with `mix 0.205`, that is 20.5% of it, while the DCTL
+applies the full BT.2100 inverse OOTF; on the test chain the two differ by up
+to 0.118 code. That 20.5% operator has no standard inverse, so a linear output
+is refused for HLG with a note in the status, and the file stays in codes until
+the mix is resolved upstream. The `levels` legal-out bracket does not apply to
+linear outputs either.
+
 
 **Cinespace output.** `csp` is derived from the CLF, never baked separately:
 the CLF is written (to a temporary file when only the csp is wanted), then an
@@ -375,7 +376,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
 | auto file names, parameter string, opendrt button auto name | A modified node names by hash, an untouched one by look preset, a tonescale-only change by tonescale name plus hash, and the hash survives a peak-luminance change; the CLF id parses and, applied to a fresh node through Apply Params, reproduces every recorded knob; the OpenDRT button names and hashes identically. | exact |
 | csp: structure, vs Nuke, prelut points on the Log node, cube vs CLF lattice | A `.csp` bake has the header, three 4096-point preluts and the id in its metadata; evaluates against Nuke within tolerance through OCIO's reader; every prelut point lies on the CLF's Log node to 1e-5; the Baker's cube equals the CLF's lattice to 1e-5 after reordering. | 3e-2 / 1e-5 / 1e-5 |
-| view+display: SDR structure, lattice exact, vs Nuke; PQ CLF structure, lattice, vs Nuke; PQ CTF 2.4 structure; HLG CTF structure, vs standard BT.2100 | The node sequence is exactly as documented for each encoding; the node's EOTF and clamp knobs are restored after the bake; SDR is exact on the lattice and PQ within half-float; both match Nuke off the lattice; the CTF 2.4 file carries version 2.4 and `Lin_TO_PQ` (evaluated only when the running OCIO is 2.4+); the HLG CTF matches the standard formula on the node's display-linear output, and the Nuke node's deviation from the standard is printed. | 2e-4 / 1e-3 / 3e-2 |
+| decode: SDR -> lin_rec709 (structure, off-lattice, lattice), PQ -> lin_ciexyzd65 (CLF structure, off-lattice; CTF 2.4 structure with PQ_TO_Lin), P3-D60 -> lin_p3d65 (Bradford), HLG fallback | The node sequences are as documented; CLF output equals the node's codes decoded in an independent implementation (Exponent or PQ EOTF, container NPM, Bradford where the container white is not D65, target primaries); SDR lattice points reproduce to 1e-4 relative; HLG refuses a linear output and stays in codes. | 3e-2 / 1e-4 |
 | levels LL structure, LL / EL / LE, LL csp | A legal-in-legal-out bake has noClamp Range nodes first and last, `levels{'LL'}` in the id, `-LL` in the name and CICP fullRange false; legal codes in give legal codes out; removing the first Range gives full in and legal out, removing the last gives legal in and full out; the csp carries the same. | 3e-2 |
 | log input code range (CLF and csp) | A log-input `fit` bake on a chain that responds above code 1.0 sets code max above 1 (1.188 on the test chain), writes a Range node and no Log node, tags the input ID with `codes0to…`, and both the CLF and the csp match Nuke on an image reaching above code 1.0. | exact / 3e-2 |
 | metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |
