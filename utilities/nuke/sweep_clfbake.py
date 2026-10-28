@@ -222,9 +222,15 @@ for i, (name, (pk, pl), disp, knobs) in enumerate(configs):
     expected = (base if ns is None and not mods else 'opendrt-v1.1:' + '|'.join([base] + mods))
     id_ok = out_id == expected
     # p95 gates interpolation quality; the max is reported and gated loosely,
-    # because a hard clip in the chain (purity compression off) puts a lattice
-    # cell across a discontinuity: measured 3.3e-2 at 48^3, 2.4e-2 at 65^3,
-    # 1.8e-2 at 97^3 for an all-modules-off bake, median error zero
+    # because with purity compression off the chain is far too nonlinear for
+    # the lattice outside the display gamut: a saturated blue-cyan's green
+    # output swings 0.65 across one 48^3 cell (-0.31 to +0.34 unclamped), so
+    # the cube interpolates the clamped corners to 0.07 where the node gives
+    # 0.17. Not a clip artefact: baking unclamped with an exact Range after
+    # the LUT3D measured no better (max worse, p99 -25%), and for the default
+    # chain or PQ it changed nothing. Measured 3.3e-2 at 48^3, 2.4e-2 at 65^3,
+    # 1.8e-2 at 97^3 for an all-modules-off bake, median error zero; up to
+    # 1e-1 on a fully saturated hue sweep.
     # automatic file name: an untouched look preset names itself
     fname = os.path.basename(clf)
     look_part = '_'.join(fname.split('__')[0].split('_')[1:-1])   # OpenDRT-v.._<look>_<condition>__...

@@ -414,8 +414,12 @@ preset, plus module-toggle combinations (all modules off, contrast modules on,
 brilliance on with hue shift off, creative white D55 with clamp off, log
 input), 35 configurations in all. For each it bakes, checks the CLF against
 Nuke's render (95th-percentile error within 3e-2 and max within 6e-2, because
-a hard clip with purity compression off puts one lattice cell across a
-discontinuity: 3.3e-2 at 48³ falling to 1.8e-2 at 97³, median zero), restores
+with purity compression off the chain is far too nonlinear for the lattice
+outside the display gamut: a saturated blue-cyan's green output swings 0.65
+across one 48³ cell, so the cube lands at 0.07 where the node gives 0.17.
+Measured 3.3e-2 at 48³ falling to 1.8e-2 at 97³, median zero; baking with the
+clamp off and an exact Range after the cube does not help, and purity
+compression, on by default, is what keeps the chain interpolable), restores
 into a fresh node and compares every recorded knob, re-bakes the restored node
 and requires LogParams and the LUT3D array to be byte-identical, and checks the
 Model block and the expected Interop output ID with its modifiers. About seven
