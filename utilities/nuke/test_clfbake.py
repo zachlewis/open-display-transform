@@ -424,7 +424,7 @@ def auto_bake(g, d, label):
 # drt is modified (tn_con, hs_r, ...), tn_Lp 200: expect a hash, not a look name
 shaper['preset'].setValue(0)   # back to T-LogE after the fit section
 auto_path, base = auto_bake(gen, drt, 'modified node')
-pat = r'OpenDRT-1\.1\.0_[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video200_tloge48\.clf$'
+pat = r'OpenDRT_v1\.1\.0-[0-9a-f]{8}-video200__lin_egamut__to__g24_rec709__48\.clf$'
 ok_mod = re.match(pat, base) is not None and os.path.exists(auto_path)
 # untouched node: look name
 for n in nuke.allNodes():
@@ -435,18 +435,19 @@ if 'clfbake_shaper' not in s6.knobs():
 d6 = paste(OPENDRT)[0]
 s6.setInput(0, img); d6.setInput(0, s6); g6.setInput(0, d6)
 _, base6 = auto_bake(g6, d6, 'untouched node')
-ok_std = re.match(r'OpenDRT-1\.1\.0_Standard_lin_egamut_scene_to_g24_rec709_display_video100_tloge48\.clf$', base6) is not None
+ok_std = re.match(r'OpenDRT_v1\.1\.0-Standard-video100__lin_egamut__to__g24_rec709__48\.clf$', base6) is not None
 # tonescale preset applied over Standard: tonescale name + hash (look no longer matches)
 vals = d6['tn_presets'].values()
 for i in range(0, len(vals) - 1, 2):
     if vals[i].endswith('/Low Contrast'):
         nuke.tcl(vals[i + 1].replace('knobs this', 'knobs %s' % d6.fullName()))
 _, base_tn = auto_bake(g6, d6, 'tonescale Low Contrast')
-ok_tn = re.match(r'OpenDRT-1\.1\.0_LowContrast-[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video100_tloge48\.clf$', base_tn) is not None
+ok_tn = re.match(r'OpenDRT_v1\.1\.0-LowContrast-[0-9a-f]{8}-video100__lin_egamut__to__g24_rec709__48\.clf$', base_tn) is not None
 # same look parameters twice -> same hash (deterministic), display change does not alter it
 d6['tn_Lp'].setValue(400)
 _, base_tn2 = auto_bake(g6, d6, 'same look, Lp 400')
-ok_det = base_tn.split('_')[1] == base_tn2.split('_')[1] and 'video400' in base_tn2
+look_of = lambda b: b.split('__')[0].split('-', 1)[1].rsplit('-', 1)[0]   # OpenDRT_v..-<look>-<condition>
+ok_det = look_of(base_tn) == look_of(base_tn2) and '-video400__' in base_tn2
 print('%s auto file names: modified %s, untouched %s, tonescale %s, deterministic %s'
       % ('PASS' if all((ok_mod, ok_std, ok_tn, ok_det)) else 'FAIL', ok_mod, ok_std, ok_tn, ok_det))
 if not all((ok_mod, ok_std, ok_tn, ok_det)):
@@ -469,7 +470,7 @@ print('   id:', pid[:160] + ('...' if len(pid) > 160 else ''))
 d2['clf_file'].setValue(OUT + '/')
 d2['bake_clf'].execute()
 base2 = os.path.basename(d2['clf_file'].value())
-ok_btn = re.match(r'OpenDRT-1\.1\.0_[0-9a-f]{8}_lin_egamut_scene_to_g24_rec709_display_video200_tloge48\.clf$', base2) is not None \
+ok_btn = re.match(r'OpenDRT_v1\.1\.0-[0-9a-f]{8}-video200__lin_egamut__to__g24_rec709__48\.clf$', base2) is not None \
     and d2['clf_params'].value().startswith('opendrt1_1{')
 print('%s opendrt button auto name: %s' % ('PASS' if ok_btn else 'FAIL', base2))
 if not ok_btn:

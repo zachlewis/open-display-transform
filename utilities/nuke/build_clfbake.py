@@ -418,7 +418,10 @@ def safe_name(s):
 
 
 def opendrt_filename(node, version, in_id, out_id, condition, shaper):
-    """Explicit, deterministic: OpenDRT-<ver>_<look|tonescale-hash|hash>_<in>_to_<out>_<condition>_<shaper><size>."""
+    """Explicit, deterministic:
+    OpenDRT_v<ver>-<look|TonescaleName-hash|hash>-<condition>__<in id>__to__<out id>__<size>
+    The head parses as version up to the first '-', condition after the last, look between.
+    The size field carries the shaper name when it is not the default T-LogE (xlog48)."""
     look = preset_match(node, 'look_presets')
     if look:
         preset = safe_name(look)
@@ -427,9 +430,11 @@ def opendrt_filename(node, version, in_id, out_id, condition, shaper):
         digest = uuid.uuid5(uuid.NAMESPACE_URL, ' '.join('%s=%s' % (k, pval(node[k])) for k in knobs if k in node.knobs())).hex[:8]
         tn = preset_match(node, 'tn_presets')
         preset = (safe_name(tn) + '-' + digest) if tn else digest
-    part = lambda i: i.split(':', 1)[-1].replace('|', '-')
-    return 'OpenDRT-%s_%s_%s_to_%s_%s_%s%d' % (version, preset, part(in_id), part(out_id), condition,
-                                               shaper['shortname'], int(shaper['cube_size']))
+    def part(i):   # namespace off, _scene/_display off, modifiers joined with '-'
+        base, mods = i.split(':')[-1].split('|')[0], i.split('|')[1:]
+        return '-'.join([re.sub(r'_(scene|display)$', '', base)] + mods)
+    size = '%s%d' % ('' if shaper['shortname'] == 'tloge' else shaper['shortname'], int(shaper['cube_size']))
+    return 'OpenDRT_v%s-%s-%s__%s__to__%s__%s' % (version, preset, condition, part(in_id), part(out_id), size)
 
 
 def is_opendrt(node):

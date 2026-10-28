@@ -60,10 +60,17 @@ reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 explicit and deterministic, never random:
 
 ```
-OpenDRT-<version>_<look>_<input id>_to_<output id>_<condition>_<shaper><size>.clf
-OpenDRT-1.1.0_Standard_lin_egamut2_scene_to_g24_rec709_display_video100_tloge48.clf
-OpenDRT-1.1.0_LowContrast-6f137a09_lin_ap1_scene_to_pq_rec2020_display-p3lim-dw148_cinema1000_tloge48.clf
+OpenDRT_v<version>-<look>-<condition>__<input id>__to__<output id>__<size>.clf
+OpenDRT_v1.1.0-Standard-video100__lin_egamut2__to__g24_rec709__48.clf
+OpenDRT_v1.1.0-LowContrast-6f137a09-cinema1000__lin_ap1__to__pq_rec2020-p3lim-dw148__48.clf
 ```
+
+Fields are separated by double underscores. The head parses as version up to
+the first hyphen, condition after the last, look in between (looks may contain
+hyphens). Interop IDs appear without namespace or `_scene`/`_display`, modifiers
+joined with hyphens; the full IDs are in the metadata. `<size>` is the lattice size, prefixed by the shaper's short name
+when it is not the default T-LogE (`xlog48`), so bakes with different shapers
+do not overwrite each other.
 
 `<look>` is the look preset's name when the node still matches one of its own
 look presets exactly (checked against the pulldown's `knobs` commands); else
