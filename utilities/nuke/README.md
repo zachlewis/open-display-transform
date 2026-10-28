@@ -243,6 +243,24 @@ Reference numbers on the OpenDRT test chain at 48³: lattice 1e-6, image
 7.8e-3, fitted image 9.9e-3. If a change moves these by more than a little,
 find out why before loosening a tolerance.
 
+`sweep_clfbake.py` is the end-to-end sweep: it drives OpenDRT through its own
+preset pulldowns, every look preset, every tonescale preset and every display
+preset, plus module-toggle combinations (all modules off, contrast modules on,
+brilliance on with hue shift off, creative white D55 with clamp off, log
+input), 35 configurations in all. For each it bakes, checks the CLF against
+Nuke's render (95th-percentile error within 3e-2 and max within 6e-2, because
+a hard clip with purity compression off puts one lattice cell across a
+discontinuity: 3.3e-2 at 48³ falling to 1.8e-2 at 97³, median zero), restores
+into a fresh node and compares every recorded knob, re-bakes the restored node
+and requires LogParams and the LUT3D array to be byte-identical, and checks the
+Model block and the expected Interop output ID with its modifiers. About seven
+minutes per Nuke version.
+
+```
+rez-env nuke fxphd -- nuke -t sweep_clfbake.py
+rez-test nuke_opendrt sweep
+```
+
 ## Updating
 
 Files in this directory:

@@ -32,6 +32,12 @@ tests = {
         'command': 'nuke -t {root}/utilities/nuke/test_clfbake.py',
         'requires': ['fxphd'],
     },
+    # every look, tonescale and display preset plus module toggles: CLF vs
+    # Nuke, restore, byte-identical re-bake, model and interop metadata
+    'sweep': {
+        'command': 'nuke -t {root}/utilities/nuke/sweep_clfbake.py',
+        'requires': ['fxphd'],
+    },
 }
 
 
