@@ -63,20 +63,27 @@ reaches 1.6e-2 at 48³ and 5.3e-3 at 65³.
 **Linear outputs.** The `output` menu can end the file in a linear
 display-referred space instead of display code values: `lin_ciexyzd65_display`
 (OpenColorIO's CIE XYZ D65 display interchange), `lin_rec709_display` or
-`lin_p3d65_display`, all with 1.0 = 100 cd/m². The cube is still baked
+`lin_p3d65_display`, on the CIF display scale (below). The cube is still baked
 code-value to code-value, exactly as for `display codes`, because that is the
 best use of the lattice: interpolation is linear in whatever the cube stores,
 and a log-in, code-out mapping is nearly straight, whereas a cube holding
 linear light misses wherever the DRT curves and the encode then stretches the
 misses in the shadows. Measured on the test chain, a linear-light cube doubled
-the SDR off-lattice error (1.6e-2 against 7.8e-3) and cost 1.5x for PQ. So the
+the SDR off-lattice error (1.6e-2 against 7.8e-3) and cost 1.5x for PQ. Storing another encoding of the same display light and unwrapping it
+exactly after the cube does not help either: measured at 48³ on the test
+chain, BT.709 OETF codes doubled the SDR error (max 3.2e-2 against 1.6e-2,
+p99 9.9e-3 against 4.4e-3), sRGB piecewise cost 1.6x, a log of display light
+1.35x, and for PQ a log store was within 3% of storing PQ, while gamma 2.4
+codes cost 1.35x. The cube's 6-decimal output quantisation is 1/240 of a
+12-bit step, so the error that remains is interpolation, and a bigger or
+fitted lattice is the lever for it, not the stored encoding. So the
 linear targets are reached by exact decode nodes appended after the cube:
 
 ```
 [Log shaper] [Range codes] LUT3D (display code values, as baked)
   Exponent basicFwd 2.2 / 2.4 / 2.6                   power EOTFs
   LUT1D halfDomain  or  FixedFunction PQ_TO_Lin        PQ (FixedFunction with ctf target 2.4)
-  Matrix   container RGB -> XYZ (1.0 = 100 cd/m2) -> [Bradford to D65] -> target primaries
+  Matrix   container RGB -> XYZ -> [Bradford to D65] -> target primaries   (omitted when identity)
 ```
 
 The one Matrix folds three things: the container's RGB-to-XYZ, a Bradford
@@ -95,7 +102,13 @@ neutral: OpenDRT mixes the container and creative white in by intensity
 white in the shadows to the creative white at peak, about 1% of RGB across the
 ramp at the default 0.25. The decode keeps that; it is the look, not an error.
 Recorded as
-`adaptation` on the Interop element. The clamp is already inside the codes, so the linear values are
+`adaptation` on the Interop element. The scale is the CIF display scale: for
+the power-function EOTFs code 1.0 decodes to 1.0 (the reference white,
+whatever the display's cd/m²), for PQ 1.0 = 100 cd/m², and for a Linear EOTF
+peak/100 as for `ocio:lin_ciexyzd65_display`. DCDM X'Y'Z' goes through the
+`g26_xyzd65_display` definition: OpenDRT's codes earn that ID by the 48/52.37
+conform, and the CIF decode is a 2.6 power times 52.37/48, so the two cancel
+and the file is a bare Exponent with 48 cd/m² white at Y = 1.0. The clamp is already inside the codes, so the linear values are
 exactly what the node's codes mean. The decode is exact: lattice points
 reproduce to 2e-5 relative for SDR; PQ through the half-domain LUT1D is within
 half-float precision, and the CTF 2.4 `PQ_TO_Lin` file agrees with it to

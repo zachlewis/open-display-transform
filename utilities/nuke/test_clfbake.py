@@ -646,7 +646,8 @@ def pq_dec100(c):
 
 
 def expected_linear(codes, eotf, gamut, lp, target):
-    """What the decode nodes must produce from the node's codes, 1.0 = 100 cd/m2."""
+    """What the decode nodes must produce from the node's codes: CIF display scale
+    (code 1.0 = 1.0 for the power EOTFs, 1.0 = 100 cd/m2 for PQ)."""
     out = []
     to_xyz = XYT[gamut] and t_npm(*XYT[gamut])
     white = XYT[gamut][3]
@@ -658,7 +659,7 @@ def expected_linear(codes, eotf, gamut, lp, target):
             lin = [pq_dec100(c) for c in p]
         else:
             gamma = {'2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6, '2.2 Power - sRGB Display': 2.2}[eotf]
-            lin = [max(c, 0.0) ** gamma * lp / 100.0 for c in p]
+            lin = [max(c, 0.0) ** gamma for c in p]
         xyz = t_mul(to_xyz, lin)
         if cat:
             xyz = t_mul(cat, xyz)
@@ -678,7 +679,7 @@ clf_lin = gen['file'].value()
 print('status:', gen['status'].value())
 tags = node_tags(clf_lin)
 r = ET.parse(clf_lin).getroot()
-ok_a = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]', 'Matrix'] \
+ok_a = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]'] \
     and r.find('Info/CLFBake/Interop').get('output') == 'lin_rec709_display' \
     and r.find('Info/CLFBake/Interop').get('decoded') == 'true' and "output{'lin_rec709_display'}" in r.get('id') \
     and '__to__lin_rec709__' in os.path.basename(clf_lin)
@@ -760,6 +761,31 @@ check('decode cwp D60 / Rec.709: white -> D65 equal RGB (rel)', spread_w, 1e-4)
 print('   full-ramp neutral spread %.2e' % spread_all)
 print('   ', os.path.basename(g3['file'].value()))
 d4['cwp'].setValue('D65')
+
+# (f) DCDM X'Y'Z' 2.6 at 48 cd/m2 -> lin_ciexyzd65_display: through the CIF g26_xyzd65_display
+#     definition (2.6 power, 52.37/48), which cancels the 48/52.37 conform of OpenDRT's codes,
+#     so the decode is a bare Exponent (plus the white adaptation if the node's white is not D65)
+#     and reference white (48 cd/m2) is 1.0
+d4['eotf'].setValue('2.6 Power DCI'); d4['display_gamut'].setValue("X'Y'Z'"); d4['tn_Lp'].setValue(48)
+g3['output'].setValue('lin_ciexyzd65_display'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+clf_dcdm = g3['file'].value()
+tags = node_tags(clf_dcdm)
+adapt_f = ET.parse(clf_dcdm).getroot().find('Info/CLFBake/Interop').get('adaptation')
+ok_f = tags[:3] == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]'] and tags[3:] == (['Matrix'] if adapt_f else []) \
+    and '__to__lin_ciexyzd65__' in os.path.basename(clf_dcdm)
+print('%s decode DCDM X\'Y\'Z\' 48 nit -> lin_ciexyzd65 structure: %s adaptation: %s' % ('PASS' if ok_f else 'FAIL', tags, adapt_f))
+if not ok_f:
+    failures.append('decode DCDM structure')
+for n in (img, shaper, d4, g3):
+    n.sample('red', 0.5, 0.5)
+live_f = sample(g3, W, H)
+exp_f = [[max(c, 0.0) ** 2.6 for c in p] for p in live_f]      # XYZ, 1.0 = 48 cd/m2 reference white
+check('decode DCDM: CLF vs codes^2.6 (rel to 1.0)', rel_err(apply_clf(clf_dcdm, lin), exp_f, 1.0), IMAGE_TOL) if not adapt_f else \
+    print('   (adapted: value check is the white below)')
+white_f = apply_clf(clf_dcdm, [[1e6] * 3])[0]
+print('   peak white XYZ %.4f %.4f %.4f (Y ~ 1 = 48 cd/m2; x,y %.4f %.4f)' % (white_f[0], white_f[1], white_f[2],
+      white_f[0] / sum(white_f), white_f[1] / sum(white_f)))
 
 # (e) HLG cannot be decoded: falls back to codes with a note
 d4['eotf'].setValue('HLG'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000)

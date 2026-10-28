@@ -237,7 +237,7 @@ def decode_white_xy(codes, eotf, gamut, lp):
         lin = [max(c, 0.0) * lp / 100.0 for c in codes]
     else:
         g = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
-        lin = [max(c, 0.0) ** g * lp / 100.0 for c in codes]
+        lin = [max(c, 0.0) ** g for c in codes]
     m = container_npm(gamut)
     X, Y, Z = [sum(m[i][k] * lin[k] for k in range(3)) for i in range(3)]
     s = X + Y + Z
@@ -251,10 +251,13 @@ LINEAR_TARGETS = {'lin_ciexyzd65_display': ('ocio:lin_ciexyzd65_display', None),
 
 def add_decode_nodes(root, dec, fixed_ok):
     """After the LUT3D, which holds the node's display code values exactly as
-    baked: exact parametric decode to a linear display-referred target with
-    1.0 = 100 cd/m2. Returns (CTF version needed, adaptation note or None)."""
+    baked: exact parametric decode to a linear display-referred target on the
+    CIF display scale: code 1.0 = 1.0 for the power-function EOTFs (reference
+    white; DCDM's 48/52.37 conform and its 52.37/48 decode cancel), 1.0 = 100
+    cd/m2 for PQ, peak/100 for a Linear EOTF (OCIO's interchange scale).
+    Returns (CTF version needed, adaptation note or None)."""
     eotf, gamut, lp = dec['eotf'], dec['gamut'], float(dec['lp'])
-    version, scale = '2', lp / 100.0
+    version, scale = '2', 1.0
     if eotf == 'PQ':
         if fixed_ok and dec.get('pq_fixed'):
             ET.SubElement(root, 'FixedFunction', inBitDepth='32f', outBitDepth='32f', style='PQ_TO_Lin')
@@ -265,25 +268,29 @@ def add_decode_nodes(root, dec, fixed_ok):
             ET.SubElement(lut, 'Array', dim='65536 1').text = '\n' + '\n'.join(
                 '            ' + v for v in half_domain_values(pq_eotf_nits100)) + '\n        '
         scale = 1.0
-    elif eotf != 'Linear':
+    elif eotf == 'Linear':
+        scale = lp / 100.0
+    else:
         gamma = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
         ex = ET.SubElement(root, 'Exponent', inBitDepth='32f', outBitDepth='32f', style='basicFwd')
         ET.SubElement(ex, 'ExponentParams', exponent=repr(gamma))
-    # container RGB (1.0 = peak) -> XYZ (1.0 = 100 cd/m2) -> [Bradford render white -> D65] -> target RGB.
+    # container RGB (1.0 = peak) -> XYZ -> [Bradford render white -> D65] -> target RGB.
     # OpenDRT encodes every P3 container with the P3-D65 matrix (the container
     # and creative white are a chromatic adaptation in XYZ before it), so the
     # P3-D60 and P3-DCI containers decode with P3-D65 too.
     m = mat_scale(container_npm(gamut), scale)
     note = None
     white = dec.get('white_xy')   # chromaticity of the decoded neutral white, measured from the chain
-    if white and (abs(white[0] - D65[0]) > 2e-4 or abs(white[1] - D65[1]) > 2e-4):
+    if white and (abs(white[0] - D65[0]) > 1e-3 or abs(white[1] - D65[1]) > 1e-3):   # D60 0.009, DCI 0.022 away
         m = mat_mul(bradford(white, D65), m)
         note = ('Bradford render white (%.4f, %.4f) -> D65, so a white neutral is D65 downstream (OCIO convention); '
                 'the white is the LUT3D\'s white corner, decoded' % white)
     target_id, target_gamut = LINEAR_TARGETS[dec['target']]
     if target_gamut:
         m = mat_mul(mat_inv(npm(*XY[target_gamut])), m)
-    add_matrix(root, m, 'decode to %s, 1.0 = 100 cd/m2%s' % (target_id, '; ' + note if note else ''))
+    unit = '1.0 = 100 cd/m2' if eotf in ('PQ', 'Linear') else 'code 1.0 = 1.0 (display white, CIF scale)'
+    if any(abs(m[i][k] - IDENTITY[i][k]) > 1e-9 for i in range(3) for k in range(3)):
+        add_matrix(root, m, 'decode to %s, %s%s' % (target_id, unit, '; ' + note if note else ''))
     return version, note
 
 
