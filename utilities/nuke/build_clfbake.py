@@ -581,7 +581,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     ET.SubElement(root, 'InputDescriptor').text = (
         shaper['preset'] if log_input else 'Linear (%s shaper)' % shaper['preset'])
     ET.SubElement(root, 'OutputDescriptor').text = tail.name()
-    nb = ET.SubElement(ET.SubElement(root, 'Info'), 'NukeBake', version='2')
+    nb = ET.SubElement(ET.SubElement(root, 'Info'), 'CLFBake', version='2')
     sh = ET.SubElement(nb, 'Shaper')
     for k in ('preset', 'shortname', 'cube_size', 'gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k'):
         if k in shaper:
@@ -627,7 +627,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
     if conform is not None:
         m = ET.SubElement(root, 'Matrix', inBitDepth='32f', outBitDepth='32f')
-        ET.SubElement(m, 'Description').text = 'conform output scale %r (see Info/NukeBake/Interop)' % conform
+        ET.SubElement(m, 'Description').text = 'conform output scale %r (see Info/CLFBake/Interop)' % conform
         ET.SubElement(m, 'Array', dim='3 3').text = '\n            %r 0 0\n            0 %r 0\n            0 0 %r\n        ' % (
             conform, conform, conform)
         root.find('OutputDescriptor').text += ' (conformed, see Interop)'
@@ -650,9 +650,9 @@ def bake_cube(generate_lut):
 def read_bake(path):
     root = ET.parse(path).getroot()
     for e in root.iter():
-        if e.tag.split('}')[-1] == 'NukeBake':
+        if e.tag.split('}')[-1] in ('CLFBake', 'NukeBake'):   # NukeBake: files from before the rename
             return e
-    raise RuntimeError('%s has no NukeBake metadata' % path)
+    raise RuntimeError('%s has no CLFBake metadata' % path)
 
 
 def restore_apply(nb, targets):

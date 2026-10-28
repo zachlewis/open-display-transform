@@ -83,7 +83,7 @@ def clf_core(path):
     lp = root.find('Log/LogParams')
     rows = [l.split() for l in root.find('LUT3D/Array').text.strip().splitlines()]
     knobs = dict((k.get('name'), k.text) for k in root.iter('Knob'))
-    nb = root.find('Info/NukeBake')
+    nb = root.find('Info/CLFBake')
     return (dict(lp.attrib) if lp is not None else None), rows, knobs, nb
 
 

@@ -88,7 +88,7 @@ clfbake{shaper{'tloge'}size{48}interpolation{'tetrahedral'}embedded{1}}
 Groups are the Model modules, leaf keys are the parameter ids, numbers are
 bare, booleans `0`/`1`, strings and enumeration labels single-quoted with `\'`
 and `\\` escapes, lists comma-separated. It is the CLF's `ProcessList id`, it
-is repeated in `<Info><NukeBake><Params>`, and the OpenDRT node's CLF Helpers
+is repeated in `<Info><CLFBake><Params>`, and the OpenDRT node's CLF Helpers
 carry it in a `params` field with **Apply Params**: paste a string from any
 CLF's id, or type one, and the node takes those values. The parser flattens
 groups, so a hand-written `opendrt1_1{tn_Lp{1000}eotf{'PQ'}}` is valid too.
@@ -108,7 +108,7 @@ domain fitting, or a chain of nodes.
   <InputDescriptor>Linear (Filmlight T-LogE shaper)</InputDescriptor>
   <OutputDescriptor>OpenDRT</OutputDescriptor>
   <Info>
-    <NukeBake version="2">
+    <CLFBake version="2">
       <Shaper preset="Filmlight T-LogE" shortname="tloge" cube_size="48" embedded="true"
               gs=".." go=".." ls=".." lo=".." lb=".." sl=".."  w0=".." o=".." x0=".." y0=".." k=".."/>
       <Nodes>                                      <!-- generic: every node, every user-facing knob -->
@@ -141,7 +141,7 @@ domain fitting, or a chain of nodes.
                [inputFallback=".." outputFallback=".." outputConform=".."]/>
       <Script>...the baked nodes as a .nk snippet (nuke.nodeCopy), for From CLF; optional...</Script>
       <Generator nuke="16.0v4" date="..." script="..."/>
-    </NukeBake>
+    </CLFBake>
   </Info>
   <Log inBitDepth="32f" outBitDepth="32f" style="cameraLinToLog">   <!-- absent with "log input" -->
     <LogParams base="2" linSideSlope=".." linSideOffset=".." logSideSlope=".." logSideOffset=".."
@@ -344,7 +344,7 @@ Where things live in the builder:
   node script capture, restore) is prepended to each of `GENERATE`, `RESTORE`,
   `FROM_CLF`, `OPENDRT_BAKE` and `OPENDRT_RESTORE`, and `script()` wraps each
   in a function. `GENERATE` also holds the domain probe and the XLog solve.
-- **Metadata schema**: `write_clf`. Bump `NukeBake version` if you change the
+- **Metadata schema**: `write_clf`. Bump `CLFBake version` if you change the
   element structure, and keep `read_bake`/`restore_apply` reading old files.
 - **Model and mastering metadata**: `OPENDRT_MODEL` (module → parameter ids),
   the `XY`, `CWP_XY`, `GAMUT_SHORT`, `EOTF_SHORT`, `CONTAINER_SHORT`,

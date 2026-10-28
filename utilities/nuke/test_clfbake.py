@@ -293,7 +293,7 @@ import xml.etree.ElementTree as ET
 
 
 def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None, conform=None, tail=None):
-    nb = ET.parse(path).getroot().find('Info/NukeBake')
+    nb = ET.parse(path).getroot().find('Info/CLFBake')
     model, mast, inter = nb.find('Model'), nb.find('Mastering'), nb.find('Interop')
     problems = []
     if callable(expect_out):
@@ -383,7 +383,7 @@ def pq_expect(nb):   # P3-limited container and HDR diffuse white are modifiers 
 
 meta_checks('pq rec2020 1000nit', clf_pq, d4, pq_expect, ('9', '16'),
             d4['tn_Lg'].value() * (1 + d4['tn_gb'].value() * math.log(10, 2)), in_id='lin_ap1_scene')
-nb_pq = ET.parse(clf_pq).getroot().find('Info/NukeBake')
+nb_pq = ET.parse(clf_pq).getroot().find('Info/CLFBake')
 cond = nb_pq.find('Mastering/ViewingEnvironment').get('condition')
 fb = nb_pq.find('Interop').get('outputFallback')
 print('%s pq viewing condition / fallback: %s / %s' % ('PASS' if (cond, fb) == ('cinema1000', 'pq_rec2020_display') else 'FAIL', cond, fb))
@@ -454,7 +454,7 @@ if not all((ok_mod, ok_std, ok_tn, ok_det)):
 
 # the CLF id is the parameter string; applying it to another node reproduces every recorded knob
 pid = ET.parse(auto_path).getroot().get('id')
-params_el = ET.parse(auto_path).getroot().find('Info/NukeBake/Params').text
+params_el = ET.parse(auto_path).getroot().find('Info/CLFBake/Params').text
 ok_id = pid.startswith('opendrt1_1{') and 'clfbake{' in pid and pid.startswith(params_el)
 d6['clf_params'].setValue(pid)
 d6['apply_params'].execute()
