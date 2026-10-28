@@ -944,6 +944,11 @@ if nuke.thisKnob().name() in ('preset', 'showPanel'):
 """ % XLOG
 
 
+ABOUT = ('<font color=#ccc><b>%s</b> | CLFBake, part of '
+         '<a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>%s<br>'
+         'Docs: utilities/nuke/README.md</font>')
+
+
 def build_shaper():
     g = nuke.nodes.Group(name='CLFShaper')
     g.begin()
@@ -974,9 +979,6 @@ def build_shaper():
     g.end()
 
     g.addKnob(nuke.Tab_Knob('CLFShaper'))
-    g.addKnob(nuke.Text_Knob('about', ' ',
-        '<font color=#ccc><b>CLFShaper</b> | part of <a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>'
-        'Place at the head of the chain to bake. CLFGenerate goes at the tail.'))
     k = nuke.Enumeration_Knob('preset', 'shaper', [p[0] for p in PRESETS])
     k.setTooltip('Log encoding used to shape the 3D LUT domain. The exact same curve is written '
                  'into the CLF as a parametric Log node, so the LUT takes linear input. '
@@ -1037,6 +1039,10 @@ def build_shaper():
     k = nuke.Boolean_Knob('probe', 'probe')
     k.setFlag(nuke.INVISIBLE)
     g.addKnob(k)
+    g.addKnob(nuke.Tab_Knob('About'))
+    g.addKnob(nuke.Text_Knob('about', ' ', ABOUT % ('CLFShaper',
+        'Place at the head of the chain to bake; CLFGenerate goes at the tail. '
+        'Passes the image through until CLFGenerate switches it to a shaped CMSTestPattern.')))
     g['knobChanged'].setValue(SHAPER_KNOBCHANGED)
     g['preset'].setValue(0)
     g['label'].setValue('[value preset]')
@@ -1056,9 +1062,6 @@ def build_generate():
     g.end()
 
     g.addKnob(nuke.Tab_Knob('CLFGenerate'))
-    g.addKnob(nuke.Text_Knob('about', ' ',
-        '<font color=#ccc><b>CLFGenerate</b> | part of <a href=https://github.com/jedypod/open-display-transform>open-display-transform</a><br>'
-        'Bakes everything between the upstream CLFShaper and this node into a CLF.'))
     k = nuke.File_Knob('file', 'file')
     k.setTooltip('Output path. Use a .ctf extension to write CTF instead of CLF. Empty: next to the script, named after the baked node.')
     g.addKnob(k)
@@ -1096,6 +1099,10 @@ def build_generate():
                  'upstream CLFShaper and this node, and restore the shaper. Baking again reproduces the CLF.')
     g.addKnob(k)
     g.addKnob(nuke.Text_Knob('status', ' ', ''))
+    g.addKnob(nuke.Tab_Knob('About'))
+    g.addKnob(nuke.Text_Knob('about', ' ', ABOUT % ('CLFGenerate',
+        'Bakes everything between the upstream CLFShaper and this node into a CLF or CTF: a parametric '
+        'Log shaper, a LUT3D, and metadata that restores or rebuilds the nodes.')))
     g['tile_color'].setValue(0x4a3a7aff)
     return g
 
