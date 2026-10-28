@@ -220,6 +220,30 @@ def add_range(root, lo_in, hi_in, lo_out, hi_out, note, no_clamp=False):
         ET.SubElement(e, tag).text = repr(float(val))
 
 
+def container_npm(gamut):
+    """RGB -> XYZ for a container as OpenDRT encodes it: P3-D65 for all P3 containers."""
+    if gamut == "X'Y'Z'":
+        return IDENTITY
+    if gamut in ('P3-D65', 'P3-D60', 'P3-DCI'):
+        return npm(*XY['P3-D65'])
+    return npm(*XY[gamut])
+
+
+def decode_white_xy(codes, eotf, gamut, lp):
+    """xy of the chain's neutral-white output after the container decode."""
+    if eotf == 'PQ':
+        lin = [pq_eotf_nits100(c) for c in codes]
+    elif eotf == 'Linear':
+        lin = [max(c, 0.0) * lp / 100.0 for c in codes]
+    else:
+        g = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
+        lin = [max(c, 0.0) ** g * lp / 100.0 for c in codes]
+    m = container_npm(gamut)
+    X, Y, Z = [sum(m[i][k] * lin[k] for k in range(3)) for i in range(3)]
+    s = X + Y + Z
+    return (X / s, Y / s) if s > 1e-9 else None
+
+
 LINEAR_TARGETS = {'lin_ciexyzd65_display': ('ocio:lin_ciexyzd65_display', None),
                   'lin_rec709_display': ('lin_rec709_display', 'Rec.709'),
                   'lin_p3d65_display': ('lin_p3d65_display', 'P3-D65')}
@@ -245,14 +269,17 @@ def add_decode_nodes(root, dec, fixed_ok):
         gamma = {'2.2 Power - sRGB Display': 2.2, '2.4 Power - Rec.1886': 2.4, '2.6 Power DCI': 2.6}[eotf]
         ex = ET.SubElement(root, 'Exponent', inBitDepth='32f', outBitDepth='32f', style='basicFwd')
         ET.SubElement(ex, 'ExponentParams', exponent=repr(gamma))
-    # container RGB (1.0 = peak) -> XYZ (1.0 = 100 cd/m2) -> [Bradford to D65] -> target RGB
-    to_xyz = IDENTITY if gamut == "X'Y'Z'" else npm(*XY[gamut])
-    m = mat_scale(to_xyz, scale)
+    # container RGB (1.0 = peak) -> XYZ (1.0 = 100 cd/m2) -> [Bradford render white -> D65] -> target RGB.
+    # OpenDRT encodes every P3 container with the P3-D65 matrix (the container
+    # and creative white are a chromatic adaptation in XYZ before it), so the
+    # P3-D60 and P3-DCI containers decode with P3-D65 too.
+    m = mat_scale(container_npm(gamut), scale)
     note = None
-    white = XY[gamut][3] if gamut in XY else D65
-    if gamut != "X'Y'Z'" and (abs(white[0] - D65[0]) > 1e-6 or abs(white[1] - D65[1]) > 1e-6):
+    white = dec.get('white_xy')   # chromaticity of the decoded neutral white, measured from the chain
+    if white and (abs(white[0] - D65[0]) > 2e-4 or abs(white[1] - D65[1]) > 2e-4):
         m = mat_mul(bradford(white, D65), m)
-        note = 'Bradford %s white (%g, %g) -> D65, as OCIO display colorspaces do' % (gamut, white[0], white[1])
+        note = ('Bradford render white (%.4f, %.4f) -> D65, so a white neutral is D65 downstream (OCIO convention); '
+                'the white is the LUT3D\'s white corner, decoded' % white)
     target_id, target_gamut = LINEAR_TARGETS[dec['target']]
     if target_gamut:
         m = mat_mul(mat_inv(npm(*XY[target_gamut])), m)
@@ -874,6 +901,10 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
     if decode:
         ET.SubElement(lut, 'Description').text = 'output: %s display code values, as the node makes them' % decode['gamut']
+        # render white = the cube's white corner (the brightest neutral the shaper admits), decoded:
+        # exactly the codes the CLF makes for a white input, so the adaptation neutralises them exactly
+        decode['white_xy'] = decode_white_xy([float(v) for v in rows[-1].split()],
+                                             decode['eotf'], decode['gamut'], float(decode['lp']))
         needed, note = add_decode_nodes(root, decode, fixed_ok=(ext == '.ctf'))
         if ext == '.ctf' and needed == '2.4':
             root.set('version', '2.4')

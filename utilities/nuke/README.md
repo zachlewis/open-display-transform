@@ -80,12 +80,22 @@ linear targets are reached by exact decode nodes appended after the cube:
 ```
 
 The one Matrix folds three things: the container's RGB-to-XYZ, a Bradford
-adaptation from the container white to D65 when that white is not D65
-(P3-D60 and P3-DCI; the rule OCIO's own display colorspaces follow, recorded as
-`adaptation` on the Interop element), and the target's XYZ-to-RGB. The
-creative white is content, not container, and is left alone: a D60 sim stays
-warm in a D65 space, as intended. X'Y'Z' is absolute colorimetry and gets no
-adaptation. The clamp is already inside the codes, so the linear values are
+adaptation from the *measured* render white to D65, and the target's
+XYZ-to-RGB. OpenDRT encodes every P3 container with the P3-D65 matrix and
+expresses container and creative white as a chromatic adaptation in XYZ
+beforehand, so P3-D60 and P3-DCI decode with P3-D65 too; the render white is
+the LUT3D's white corner (the chain's output for the brightest neutral the
+shaper admits), decoded. Adapting it to D65 means a white patch is D65, equal
+RGB, in the linear target whatever the container or creative white, exactly,
+because the adaptation is built from the very codes the LUT makes for white. That is OCIO's convention (reference neutral = the display's
+white; "D60 sim" variants are the ones that do not adapt), so downstream
+display colorspaces can adapt or sim as they choose. Only the white is exactly
+neutral: OpenDRT mixes the container and creative white in by intensity
+(`cwp_lm`, the creative white limit), so a grey ramp drifts from the display
+white in the shadows to the creative white at peak, about 1% of RGB across the
+ramp at the default 0.25. The decode keeps that; it is the look, not an error.
+Recorded as
+`adaptation` on the Interop element. The clamp is already inside the codes, so the linear values are
 exactly what the node's codes mean. The decode is exact: lattice points
 reproduce to 2e-5 relative for SDR; PQ through the half-domain LUT1D is within
 half-float precision, and the CTF 2.4 `PQ_TO_Lin` file agrees with it to
@@ -376,7 +386,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
 | auto file names, parameter string, opendrt button auto name | A modified node names by hash, an untouched one by look preset, a tonescale-only change by tonescale name plus hash, and the hash survives a peak-luminance change; the CLF id parses and, applied to a fresh node through Apply Params, reproduces every recorded knob; the OpenDRT button names and hashes identically. | exact |
 | csp: structure, vs Nuke, prelut points on the Log node, cube vs CLF lattice | A `.csp` bake has the header, three 4096-point preluts and the id in its metadata; evaluates against Nuke within tolerance through OCIO's reader; every prelut point lies on the CLF's Log node to 1e-5; the Baker's cube equals the CLF's lattice to 1e-5 after reordering. | 3e-2 / 1e-5 / 1e-5 |
-| decode: SDR -> lin_rec709 (structure, off-lattice, lattice), PQ -> lin_ciexyzd65 (CLF structure, off-lattice; CTF 2.4 structure with PQ_TO_Lin), P3-D60 -> lin_p3d65 (Bradford), HLG fallback | The node sequences are as documented; CLF output equals the node's codes decoded in an independent implementation (Exponent or PQ EOTF, container NPM, Bradford where the container white is not D65, target primaries); SDR lattice points reproduce to 1e-4 relative; HLG refuses a linear output and stays in codes. | 3e-2 / 1e-4 |
+| decode: SDR -> lin_rec709 (structure, off-lattice, lattice), PQ -> lin_ciexyzd65 (CLF structure, off-lattice; CTF 2.4 structure with PQ_TO_Lin), P3-D60 -> lin_p3d65 and creative white D60 -> lin_rec709 (Bradford), HLG fallback | The node sequences are as documented; CLF output equals the node's codes decoded in an independent implementation (Exponent or PQ EOTF, P3-D65 NPM for every P3 container, Bradford from the measured render white, target primaries); SDR lattice points reproduce to 1e-4 relative; a white input decodes to equal RGB (D65) to 1e-4 for a D60 container and for a D60 creative white, and the grey ramp's drift from OpenDRT's creative white limit is reported; HLG refuses a linear output and stays in codes. | 3e-2 / 1e-4 |
 | levels LL structure, LL / EL / LE, LL csp | A legal-in-legal-out bake has noClamp Range nodes first and last, `levels{'LL'}` in the id, `-LL` in the name and CICP fullRange false; legal codes in give legal codes out; removing the first Range gives full in and legal out, removing the last gives legal in and full out; the csp carries the same. | 3e-2 |
 | log input code range (CLF and csp) | A log-input `fit` bake on a chain that responds above code 1.0 sets code max above 1 (1.188 on the test chain), writes a Range node and no Log node, tags the input ID with `codes0to…`, and both the CLF and the csp match Nuke on an image reaching above code 1.0. | exact / 3e-2 |
 | metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |

@@ -721,22 +721,46 @@ print('%s decode PQ CTF 2.4 structure: version %s %s' % ('PASS' if ok_c else 'FA
 if not ok_c:
     failures.append('decode PQ CTF structure')
 g3['format'].setValue('clf'); g3['ocio'].setValue('2.1')
-# (d) P3-D60 2.6 container -> lin_p3d65_display: Bradford D60 -> D65 inside the Matrix
+# (d) P3-D60 2.6 container -> lin_p3d65_display: decoded with the P3-D65 matrix (as
+#     OpenDRT encodes it) and Bradford-adapted from the measured render white to D65,
+#     so a neutral input is D65, equal RGB, in the linear target
 d4['eotf'].setValue('2.6 Power DCI'); d4['display_gamut'].setValue('P3-D60'); d4['tn_Lp'].setValue(100)
 g3['output'].setValue('lin_p3d65_display'); g3['file'].setValue(OUT + '/')
 g3['generate'].execute()
 clf_d60 = g3['file'].value()
 r = ET.parse(clf_d60).getroot()
 adapt = r.find('Info/CLFBake/Interop').get('adaptation') or ''
-ok_d = node_tags(clf_d60) == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]', 'Matrix'] and adapt.startswith('Bradford P3-D60')
+ok_d = node_tags(clf_d60) == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicFwd]', 'Matrix'] and adapt.startswith('Bradford render white')
 print('%s decode P3-D60 -> lin_p3d65: adaptation "%s"' % ('PASS' if ok_d else 'FAIL', adapt))
 if not ok_d:
     failures.append('decode P3-D60 structure')
-for n in (img, s3, d4, g3):
-    n.sample('red', 0.5, 0.5)
-live4 = sample(g3, W, H)
-exp4 = expected_linear(live4, '2.6 Power DCI', 'P3-D60', 100, 'lin_p3d65_display')
-check('decode P3-D60: CLF vs decoded+adapted codes (rel to 1)', rel_err(apply_clf(clf_d60, lin), exp4, 1.0), IMAGE_TOL)
+neutral = [[v] * 3 for v in [0.18 * 2 ** (s / 2.0) for s in range(-12, 11)] + [1e3, 1e4, 1e6]]
+
+
+def neutral_spread(path):
+    # OpenDRT mixes container and creative white in by intensity (cwp_lm), so only a
+    # white is promised D65: check the whites above the shaper's top (the LUT's white
+    # corner, which the adaptation neutralises by construction), report the whole ramp
+    out_n = apply_clf(path, neutral)
+    peak = max(max(p) for p in out_n)
+    whites = [p for n_in, p in zip(neutral, out_n) if n_in[0] >= 1e3]
+    return (max(max(p) - min(p) for p in whites) / peak,
+            max(max(p) - min(p) for p in out_n if max(p) > 1e-3) / peak)
+
+
+spread_w, spread_all = neutral_spread(clf_d60)
+check('decode P3-D60: white -> D65 equal RGB (rel)', spread_w, 1e-4)
+print('   full-ramp neutral spread %.2e (OpenDRT\'s creative white limit mixes by intensity)' % spread_all)
+# the same with a D60 creative white in a Rec.709 container: the sim is adapted away downstream
+d4['display_gamut'].setValue('Rec.709'); d4['eotf'].setValue('2.4 Power - Rec.1886'); d4['cwp'].setValue('D60')
+g3['output'].setValue('lin_rec709_display'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+spread_w, spread_all = neutral_spread(g3['file'].value())
+check('decode cwp D60 / Rec.709: white -> D65 equal RGB (rel)', spread_w, 1e-4)
+print('   full-ramp neutral spread %.2e' % spread_all)
+print('   ', os.path.basename(g3['file'].value()))
+d4['cwp'].setValue('D65')
+
 # (e) HLG cannot be decoded: falls back to codes with a note
 d4['eotf'].setValue('HLG'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000)
 g3['output'].setValue('lin_ciexyzd65_display'); g3['file'].setValue(OUT + '/')
