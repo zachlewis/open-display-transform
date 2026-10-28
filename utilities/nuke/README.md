@@ -37,6 +37,7 @@ chain as linear.
 | file | Output path. A `.ctf` extension writes CTF instead of CLF. A directory, or empty (the script's directory), names the file automatically; see below. |
 | format | `clf` (default), `ctf`, or `csp` for automatically named files. An explicit extension on a file path wins. |
 | interpolation | Recorded in the LUT3D node. Tetrahedral by default. |
+| levels | `full` (default): 0 to 1 code values in and out, which is what OCIO and the CIF display IDs expect. `legal in`, `legal out`, `legal in and out`: 64 to 940 on 1023, written as **unclamped `noClamp` Range nodes first and/or last in the CLF**, so deleting the first or the last node turns a legal-legal file into full-legal or legal-full exactly. Legal in applies to log input only; a linear input has no video range. The levels appear as an `LL` / `LE` / `EL` / `EE` modifier on the output ID and the CICP `fullRange` flag follows. OCIO applies these nodes, it does not optimise them away, which is why `full` stays the default. |
 | log input | Omit the Log node and declare the shaper's log encoding as the input, the way the released OpenDRT config consumes its cubes. Off by default: the shaper is embedded and the CLF takes linear input. |
 | embed node script | Also store the baked nodes as a Nuke script in the CLF so From CLF can rebuild them. On by default; the structured metadata is written regardless. |
 | domain | **preset**: use the shaper as set. **auto**: probe the chain and replace the preset with a fitted XLog only if the chain still changes beyond the preset's range. **fit**: always fit. See below. |
@@ -110,8 +111,13 @@ OpenDRT-v1.1.0_LowContrast-6f137a09_cinema1000__lin_ap1__to__pq_rec2020-p3lim-dw
 
 Three sections separated by double underscores: the head (version, look,
 condition, single underscores; looks may contain hyphens), the input and
-output IDs joined by `__to__`, and the size. Interop IDs appear without namespace or `_scene`/`_display`, modifiers
-joined with hyphens; the full IDs are in the metadata. `<size>` is the lattice size, prefixed by the shaper's short name
+output IDs joined by `__to__`, and the size. Interop IDs appear without
+namespace or `_scene`/`_display` and without the shaper code-range modifier,
+other modifiers joined with hyphens; the full IDs are in the metadata. The
+size is prefixed by the shaper's short name when it is not the default T-LogE
+(`xlog48`): a T-LogE and a fitted XLog bake of the same node are different
+LUTs and neither is better in general (T-LogE is more accurate inside its 512
+domain, XLog beyond it), so they must not overwrite each other. `<size>` is the lattice size, prefixed by the shaper's short name
 when it is not the default T-LogE (`xlog48`), so bakes with different shapers
 do not overwrite each other.
 
@@ -327,6 +333,7 @@ failure. The CLFs it wrote stay in the temp directory it prints.
 | rebake from CLF (standalone, opendrt button) | From CLF on a fresh bookend pair rebuilds the chain; baking it again gives identical LogParams, all 110,592 LUT rows, and all recorded knobs. | byte-identical |
 | auto file names, parameter string, opendrt button auto name | A modified node names by hash, an untouched one by look preset, a tonescale-only change by tonescale name plus hash, and the hash survives a peak-luminance change; the CLF id parses and, applied to a fresh node through Apply Params, reproduces every recorded knob; the OpenDRT button names and hashes identically. | exact |
 | csp: structure, vs Nuke, prelut points on the Log node, cube vs CLF lattice | A `.csp` bake has the header, three 4096-point preluts and the id in its metadata; evaluates against Nuke within tolerance through OCIO's reader; every prelut point lies on the CLF's Log node to 1e-5; the Baker's cube equals the CLF's lattice to 1e-5 after reordering. | 3e-2 / 1e-5 / 1e-5 |
+| levels LL structure, LL / EL / LE, LL csp | A legal-in-legal-out bake has noClamp Range nodes first and last, `levels{'LL'}` in the id, `-LL` in the name and CICP fullRange false; legal codes in give legal codes out; removing the first Range gives full in and legal out, removing the last gives legal in and full out; the csp carries the same. | 3e-2 |
 | log input code range (CLF and csp) | A log-input `fit` bake on a chain that responds above code 1.0 sets code max above 1 (1.188 on the test chain), writes a Range node and no Log node, tags the input ID with `codes0to…`, and both the CLF and the csp match Nuke on an image reaching above code 1.0. | exact / 3e-2 |
 | metadata (sdr rec1886, pq rec2020 1000nit, dcdm xyz 2.6, linear xyz 1000nit) | Every Model attribute is a real knob id with the node's value; DisplayColorVolume, measured luminances, CICP, Interop IDs with namespace, modifiers and fallback, and the viewing condition token are right for four configurations; in the dark-surround PQ case measured grey is within 3% of nominal, which also validates the PQ decode; the two conformed outputs match the node times the recorded scale; `embed node script` off omits the script. | exact / 3% / 3e-2 |
 

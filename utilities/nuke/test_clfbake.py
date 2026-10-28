@@ -532,7 +532,7 @@ root_r = ET.parse(clf_rng).getroot()
 rng = root_r.find('Range')
 in_id_r = root_r.find('Info/CLFBake/Interop').get('input')
 ok_rng = cmax > 1.0 and rng is not None and abs(float(rng.find('maxInValue').text) - cmax) < 1e-9 \
-    and root_r.find('Log') is None and '|codes' in in_id_r and '-codes' in os.path.basename(clf_rng)
+    and root_r.find('Log') is None and '|codes' in in_id_r and '-codes' not in os.path.basename(clf_rng)
 print('%s log input code range: code_max %.3f, Range node %s, input %s\n   %s' % (
     'PASS' if ok_rng else 'FAIL', cmax, 'present' if rng is not None else 'MISSING', in_id_r, os.path.basename(clf_rng)))
 if not ok_rng:
@@ -555,6 +555,43 @@ gen['log_input'].setValue(False)
 shaper['code_min'].setValue(0.0)
 shaper['code_max'].setValue(1.0)
 shaper.setInput(0, img)
+
+# --- 13. levels: legal in / legal out as removable unclamped Range nodes --------------
+LO, HI = 64.0 / 1023.0, 940.0 / 1023.0
+to_legal = lambda v: LO + v * (HI - LO)
+gen['log_input'].setValue(True)
+gen['levels'].setValue('legal in and out')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+clf_ll = gen['file'].value()
+root_ll = ET.parse(clf_ll).getroot()
+nodes_ll = [e for e in root_ll if e.tag in ('Range', 'Log', 'LUT3D', 'Matrix')]
+ok_struct = nodes_ll[0].tag == 'Range' and nodes_ll[0].get('style') == 'noClamp' and nodes_ll[-1].tag == 'Range' \
+    and nodes_ll[-1].get('style') == 'noClamp' and "levels{'LL'}" in root_ll.get('id') and '-LL__' in os.path.basename(clf_ll) \
+    and root_ll.find('Info/CLFBake/Mastering/CICP').get('fullRange') == 'false'
+print('%s levels LL structure: %s' % ('PASS' if ok_struct else 'FAIL', os.path.basename(clf_ll)))
+if not ok_struct:
+    failures.append('levels structure')
+logpix = [[lin_to_log(shaper, c) for c in p] for p in lin]
+live = sample(gen, W, H)
+legal_in_px = [[to_legal(c) for c in p] for p in logpix]
+legal_live = [[to_legal(c) for c in p] for p in live]
+check('levels LL: legal codes in -> legal out', max_err(apply_clf(clf_ll, legal_in_px), legal_live), IMAGE_TOL)
+# delete the first Range -> full in, legal out; delete the last -> legal in, full out
+for drop, name, src_px, ref in ((0, 'EL (first Range removed)', logpix, legal_live),
+                                (-1, 'LE (last Range removed)', legal_in_px, live)):
+    r = ET.parse(clf_ll).getroot()
+    r.remove([e for e in r if e.tag == 'Range' and e.get('style') == 'noClamp'][drop])
+    p = os.path.join(OUT, 'levels_%s.clf' % name[:2])
+    ET.ElementTree(r).write(p, encoding='UTF-8', xml_declaration=True)
+    check('levels %s' % name, max_err(apply_clf(p, src_px), ref), IMAGE_TOL)
+gen['format'].setValue('csp')
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+check('levels LL csp: legal in -> legal out', max_err(apply_clf(gen['file'].value(), legal_in_px), legal_live), IMAGE_TOL)
+gen['format'].setValue('clf')
+gen['levels'].setValue('full')
+gen['log_input'].setValue(False)
 
 print('outputs in', OUT)
 if failures:

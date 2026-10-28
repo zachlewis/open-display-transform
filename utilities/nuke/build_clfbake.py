@@ -159,7 +159,7 @@ def bake_csp(path, clf_path, n, shaper, log_input, meta_lines):
     cfg.setRole('default', 'reference')
     c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
     ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
-    use_shaper = (not log_input) or ranged
+    use_shaper = (not log_input) or ranged or bool(shaper.get('legal_in'))
     if use_shaper:
         # With a NamedTransform as shaper space, the Baker applies its FORWARD
         # transform as shaper -> input (measured, OCIO 2.2 and 2.3), so the
@@ -167,6 +167,10 @@ def bake_csp(path, clf_path, n, shaper, log_input, meta_lines):
         grp = ocio.GroupTransform()
         if ranged:
             grp.appendTransform(ocio.RangeTransform(minInValue=0.0, maxInValue=1.0, minOutValue=c0, maxOutValue=c1))
+        if log_input and shaper.get('legal_in'):   # the CLF's input is legal-range codes
+            rt = ocio.RangeTransform(minInValue=0.0, maxInValue=1.0, minOutValue=64.0 / 1023.0, maxOutValue=940.0 / 1023.0)
+            rt.setStyle(ocio.RANGE_NO_CLAMP)
+            grp.appendTransform(rt)
         if not log_input:
             grp.appendTransform(ocio.LogCameraTransform(
                 base=2.0, linSideBreak=[float(shaper['lb'])] * 3,
@@ -500,9 +504,11 @@ def opendrt_filename(node, version, in_id, out_id, condition, shaper):
         digest = uuid.uuid5(uuid.NAMESPACE_URL, ' '.join('%s=%s' % (k, pval(node[k])) for k in knobs if k in node.knobs())).hex[:8]
         tn = preset_match(node, 'tn_presets')
         preset = (safe_name(tn) + '-' + digest) if tn else digest
-    def part(i):   # namespace off, _scene/_display off, modifiers joined with '-'
-        base, mods = i.split(':')[-1].split('|')[0], i.split('|')[1:]
+    def part(i):   # namespace off, _scene/_display off, shaper code range off, modifiers joined with '-'
+        base, mods = i.split(':')[-1].split('|')[0], [m for m in i.split('|')[1:] if not m.startswith('codes')]
         return '-'.join([re.sub(r'_(scene|display)$', '', base)] + mods)
+    # a non-default shaper is named: T-LogE and a fitted XLog bake of one node are different LUTs,
+    # neither better in general (T-LogE wins inside its 512 domain, XLog beyond it)
     size = '%s%d' % ('' if shaper['shortname'] == 'tloge' else shaper['shortname'], int(shaper['cube_size']))
     return 'OpenDRT-v%s_%s_%s__%s__to__%s__%s' % (version, preset, condition, part(in_id), part(out_id), size)
 
@@ -559,8 +565,9 @@ def interop_ids(node, ns, log_input, shaper, measured):
         mods.append('dw%d' % int(round(to_nits(sum(measured[1]) / 3.0, eotf, lp))))
     if not node['clamp'].value():
         mods.append('clamp0')
-    if log_input:
-        mods.append('EE')
+    levels = ('L' if (log_input and shaper.get('legal_in')) else 'E') + ('L' if shaper.get('legal_out') else 'E')
+    if log_input or levels != 'EE':
+        mods.append(levels)
     published = base in PUBLISHED_OUT
     if published and not mods:
         out_id, out_fb = base, None
@@ -631,7 +638,8 @@ def describe_opendrt(nb, node, log_input, measured, shaper):
                        'a non-D65 container therefore carries D65 content white unless modified')
     if gamut in CICP_PRIMARIES and eotf in CICP_TRANSFER:
         ET.SubElement(mast, 'CICP', primaries=str(CICP_PRIMARIES[gamut]), transfer=str(CICP_TRANSFER[eotf]),
-                      matrix='0', fullRange='true', note='ITU-T H.273; transfer 1 signals BT.709/BT.1886 by convention')
+                      matrix='0', fullRange='false' if shaper.get('legal_out') else 'true',
+                      note='ITU-T H.273; transfer 1 signals BT.709/BT.1886 by convention')
     in_id, in_fb, out_id, out_fb, conform = interop_ids(node, ns, log_input, shaper, measured)
     inter = ET.SubElement(nb, 'Interop', input=in_id, output=out_id, namespace=ns)
     if in_fb:
@@ -692,9 +700,11 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         root.set('compCLFversion', '3')
     c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
     ranged = abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9
-    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}%s}' % (
+    legal_in, legal_out = bool(log_input and shaper.get('legal_in')), bool(shaper.get('legal_out'))
+    levels = ('L' if legal_in else 'E') + ('L' if legal_out else 'E')
+    bake = 'clfbake{shaper{%s}size{%d}interpolation{%s}embedded{%d}levels{%s}%s}' % (
         pq(shaper['shortname']), int(shaper['cube_size']), pq(interpolation), 0 if log_input else 1,
-        'codes{%r,%r}' % (c0, c1) if ranged else '')
+        pq(levels), 'codes{%r,%r}' % (c0, c1) if ranged else '')
     pid = (desc['params'] + bake) if desc else '%s__%s%d' % (tail.name(), shaper['shortname'], int(shaper['cube_size']))
     root.set('id', pid)
     csp_path = None
@@ -708,6 +718,17 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
     ET.SubElement(nb, 'Generator', nuke=nuke.NUKE_VERSION_STRING,
                   date=datetime.datetime.now().isoformat(timespec='seconds'),
                   script=nuke.root().name())
+    LEGAL = (64.0 / 1023.0, 940.0 / 1023.0)
+
+    def levels_range(where, lo_in, hi_in, lo_out, hi_out):
+        # unclamped (noClamp) affine Range: delete this node to change the file's levels
+        rng = ET.SubElement(root, 'Range', inBitDepth='32f', outBitDepth='32f', style='noClamp')
+        ET.SubElement(rng, 'Description').text = 'levels: %s (remove this node for full range)' % where
+        for tag, val in (('minInValue', lo_in), ('maxInValue', hi_in), ('minOutValue', lo_out), ('maxOutValue', hi_out)):
+            ET.SubElement(rng, tag).text = repr(val)
+
+    if legal_in:   # first process node: legal -> full on the input code values
+        levels_range('legal input', LEGAL[0], LEGAL[1], 0.0, 1.0)
     if not log_input:
         log = ET.SubElement(root, 'Log', inBitDepth='32f', outBitDepth='32f', style='cameraLinToLog')
         ET.SubElement(log, 'LogParams', base='2',
@@ -727,6 +748,12 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
         ET.SubElement(m, 'Array', dim='3 3').text = '\n            %r 0 0\n            0 %r 0\n            0 0 %r\n        ' % (
             conform, conform, conform)
         root.find('OutputDescriptor').text += ' (conformed, see Interop)'
+    if legal_out:   # last process node: full -> legal on the output code values
+        levels_range('legal output', 0.0, 1.0, LEGAL[0], LEGAL[1])
+    if legal_in:
+        root.find('InputDescriptor').text += ' (legal range)'
+    if legal_out:
+        root.find('OutputDescriptor').text += ' (legal range)'
     if hasattr(ET, 'indent'):
         ET.indent(root, '    ')
     arr.text = '\n' + '\n'.join('            ' + r for r in rows) + '\n        '
@@ -933,6 +960,8 @@ shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb'
 shaper['preset'] = shaper_node['preset'].value()
 shaper['shortname'] = SHORT[int(shaper_node['preset'].getValue())]
 shaper['cube_size'] = int(shaper_node['cube_size'].value())
+shaper['legal_in'] = gen['levels'].value() in ('legal in', 'legal in and out')
+shaper['legal_out'] = gen['levels'].value() in ('legal out', 'legal in and out')
 log_input = bool(gen['log_input'].value())
 
 path = gen['file'].evaluate()
@@ -1226,6 +1255,12 @@ def build_generate():
     g.addKnob(k)
     k = nuke.Enumeration_Knob('interpolation', 'interpolation', ['tetrahedral', 'trilinear'])
     k.setTooltip('Interpolation recorded in the LUT3D node.')
+    g.addKnob(k)
+    k = nuke.Enumeration_Knob('levels', 'levels', ['full', 'legal in', 'legal out', 'legal in and out'])
+    k.setTooltip('Code value range of the file\'s input and output. full: 0-1 as the chain produces (what the '
+                 'CIF display IDs and OCIO expect). legal: 64-940/1023, written as unclamped Range nodes '
+                 'first and/or last in the CLF, so deleting the first or last node changes the file\'s '
+                 'levels exactly. legal in applies to log input only; a linear input has no video range.')
     g.addKnob(k)
     k = nuke.Boolean_Knob('log_input', 'log input')
     k.setTooltip('Omit the shaper from the CLF so it takes the shaper log encoding as input, '
