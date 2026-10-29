@@ -44,6 +44,7 @@ tests = {
 def commands():
     # append: nuke setenvs NUKE_PATH and we run after it because we require it.
     env.NUKE_PATH.append('{root}/nuke')   # Nuke finds ToolSets/ beneath this
+    env.NUKE_PATH.append('{root}/utilities/nuke')   # clfbake.py, which the node buttons import
 
 
 help = 'file://{root}/utilities/nuke/README.md'

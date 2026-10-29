@@ -24,6 +24,7 @@ import nuke
 import PyOpenColorIO as ocio
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+sys.path.insert(0, HERE)   # the buttons import clfbake
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 CLFBAKE = os.path.join(HERE, 'CLFBake.nk')
 OPENDRT = os.path.join(ROOT, 'display-transforms', 'opendrt', 'OpenDRT.nk')
