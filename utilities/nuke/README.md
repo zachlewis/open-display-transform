@@ -146,9 +146,19 @@ with a 13,877 top, which an HDR or `fit` bake gets, puts one sample every
 0.1 to 1.0 band against 8e-3 for the same bake's CLF. A csp with a high
 shaper top is unusable through OpenColorIO. Hosts that interpolate the
 prelut on its given points reproduce the shaper to about 1e-7 at any top.
-Give OCIO the CLF. (The fix belongs in OCIO's reader, which could resample
-the prelut onto a half-float domain instead; the source carries a TODO
-there.)
+A bigger prelut does not help: OCIO's sample count and positions are its
+own, whatever the file holds, and 4096 points already place the log curve to
+1e-7 for hosts that use them. What does work through OCIO is a **log input**
+csp: the file then has no shaper to resample, the config applies the T-LogE
+(the CLF's Log node as a `LogCameraTransform`) before it, and the csp read
+with tetrahedral interpolation equals the CLF exactly, to the last digit on
+the harness image, which is how the released OpenDRT config consumes its
+cubes. Note that OCIO applies a csp trilinear unless the `FileTransform`
+sets tetrahedral (the CLF carries its interpolation in the file); the
+difference is 6e-3 to 8e-3 on the test chain. Otherwise give OCIO the CLF.
+(The fix for the linear-input case belongs in OCIO's reader, which could
+resample the prelut onto a half-float domain instead; the source carries a
+TODO there.)
 
 **Code range for log input.** A log encoding's own range, codes 0 to 1, tops
 out low in linear for some encodings: S-Log3 at 38, LogC3 at 55, ACEScct at
