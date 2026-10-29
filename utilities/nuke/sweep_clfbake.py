@@ -1,8 +1,8 @@
 """End-to-end sweep: OpenDRT look presets, display presets and module toggles
 through CLFBake, checking that every CLF round-trips.
 
-    rez-env nuke fxphd -- nuke -t sweep_clfbake.py
-    rez-test nuke_opendrt sweep          (from the installed package)
+    nuke -t sweep_clfbake.py
+    CLFBAKE_DOMAIN=auto nuke -t sweep_clfbake.py   # code range from the chain
 
 For each configuration (applied through OpenDRT's own preset pulldowns, as a
 user would):
@@ -28,6 +28,7 @@ ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 CLFBAKE = os.path.join(HERE, 'CLFBake.nk')
 OPENDRT = os.path.join(ROOT, 'display-transforms', 'opendrt', 'OpenDRT.nk')
 OUT = tempfile.mkdtemp(prefix='clfbake_sweep_')
+DOMAIN = os.environ.get('CLFBAKE_DOMAIN', 'preset')
 W = H = 20
 IMAGE_TOL = 3e-2
 
@@ -177,9 +178,17 @@ for i, (name, (pk, pl), disp, knobs) in enumerate(configs):
         drt[k].setValue(v)
     log_input = name.endswith('log input')
     g1['log_input'].setValue(log_input)
+    g1['domain'].setValue(DOMAIN)
     g1['file'].setValue(OUT + '/')          # directory only: automatic, explicit name
     g1['generate'].execute()
     clf = g1['file'].value()
+    if DOMAIN == 'auto':   # test up to the top auto chose; the re-bake chain gets the same range
+        top = log_to_lin(s1, s1['code_max'].value())
+        img['expr0'].setValue('%r*pow(2,24*(x/width-1))' % top)
+        img['expr1'].setValue('%r*pow(2,24*(y/height-1))' % top)
+        lin = sample(img)
+        for k in ('code_min', 'code_max'):
+            s2[k].setValue(s1[k].value())
     live = sample(g1)
     src = [[lin_to_log(s1, c) for c in p] for p in lin] if log_input else lin
     lp, arr, kv, nb = clf_core(clf)

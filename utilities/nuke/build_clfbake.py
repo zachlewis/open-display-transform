@@ -1,7 +1,7 @@
 """Build CLFBake.nk (CLFShaper + CLFGenerate) and the thin "CLF Helpers"
 buttons in OpenDRT.nk. Run inside Nuke so knob scripts are escaped by Nuke:
 
-    rez-env nuke fxphd -- nuke -t build_clfbake.py
+    nuke -t build_clfbake.py
 
 Writes utilities/nuke/CLFBake.nk and splices the CLF Helpers knob group into
 display-transforms/opendrt/OpenDRT.nk (replacing it if already present).
@@ -109,12 +109,6 @@ def knob_values(n):
         except Exception:
             pass
     return out
-
-
-def default_path(node, short, ext='.clf'):
-    root = nuke.root().name()
-    d = os.path.dirname(root) if root and root != 'Root' else tempfile.gettempdir()
-    return os.path.join(d, '%s__%s%s' % (node.name(), short, ext)).replace(os.sep, '/')
 
 
 def read_cube(path):
@@ -280,7 +274,7 @@ def add_decode_nodes(root, dec, fixed_ok):
     # P3-D60 and P3-DCI containers decode with P3-D65 too.
     m = mat_scale(container_npm(gamut), scale)
     note = None
-    white = dec.get('white_xy')   # chromaticity of the decoded neutral white, measured from the chain
+    white = dec.get('white_xy')   # chromaticity of the LUT's white corner, decoded
     if white and (abs(white[0] - D65[0]) > 1e-3 or abs(white[1] - D65[1]) > 1e-3):   # D60 0.009, DCI 0.022 away
         m = mat_mul(bradford(white, D65), m)
         note = ('Bradford render white (%.4f, %.4f) -> D65, so a white neutral is D65 downstream (OCIO convention); '
@@ -665,9 +659,13 @@ def opendrt_filename(node, version, in_id, out_id, condition, shaper):
     def part(i):   # namespace off, _scene/_display off, shaper code range off, modifiers joined with '-'
         base, mods = i.split(':')[-1].split('|')[0], [m for m in i.split('|')[1:] if not m.startswith('codes')]
         return '-'.join([re.sub(r'_(scene|display)$', '', base)] + mods)
-    # a non-default shaper is named: T-LogE and a fitted XLog bake of one node are different LUTs,
-    # neither better in general (T-LogE wins inside its 512 domain, XLog beyond it)
+    # a non-default shaper is named, and an extended code range gives its scene top: a plain and an
+    # extended bake of one node are different LUTs, neither better in general (plain wins below 512)
     size = '%s%d' % ('' if shaper['shortname'] == 'tloge' else shaper['shortname'], int(shaper['cube_size']))
+    c1 = float(shaper.get('code_max', 1.0))
+    if c1 > 1.0 + 1e-9:
+        top = (2.0 ** ((c1 - float(shaper['go'])) / float(shaper['gs'])) - float(shaper['lo'])) / float(shaper['ls'])
+        size += '-to%dk' % round(top / 1000.0) if top >= 1000 else '-to%d' % round(top)
     return 'OpenDRT-v%s_%s_%s__%s__to__%s__%s' % (version, preset, condition, part(in_id), part(out_id), size)
 
 
@@ -706,7 +704,7 @@ def interop_ids(node, ns, log_input, shaper, measured):
         base = 'lin_%s_scene' % g
         in_id, in_fb = (base, None) if base in PUBLISHED_IN else ('%s:%s' % (ns, base), None)
     c0, c1 = float(shaper.get('code_min', 0.0)), float(shaper.get('code_max', 1.0))
-    if abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9:   # the lattice spans codes [c0, c1] of that encoding
+    if log_input and (abs(c0) > 1e-9 or abs(c1 - 1.0) > 1e-9):   # the lattice spans codes [c0, c1] of that encoding
         base = in_id.split(':')[-1]
         in_fb = in_fb or (base if base in PUBLISHED_IN or in_id.startswith('ocio:') else None)
         in_id = '%s:%s|codes%gto%g' % (ns, base, c0, c1)
@@ -884,15 +882,9 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
                   script=nuke.root().name())
     LEGAL = (64.0 / 1023.0, 940.0 / 1023.0)
 
-    def levels_range(where, lo_in, hi_in, lo_out, hi_out):
-        # unclamped (noClamp) affine Range: delete this node to change the file's levels
-        rng = ET.SubElement(root, 'Range', inBitDepth='32f', outBitDepth='32f', style='noClamp')
-        ET.SubElement(rng, 'Description').text = 'levels: %s (remove this node for full range)' % where
-        for tag, val in (('minInValue', lo_in), ('maxInValue', hi_in), ('minOutValue', lo_out), ('maxOutValue', hi_out)):
-            ET.SubElement(rng, tag).text = repr(val)
-
+    # levels are unclamped (noClamp) affine Ranges: delete one to change the file's levels
     if legal_in:   # first process node: legal -> full on the input code values
-        levels_range('legal input', LEGAL[0], LEGAL[1], 0.0, 1.0)
+        add_range(root, LEGAL[0], LEGAL[1], 0.0, 1.0, 'levels: legal input (remove this node for full range)', True)
     if not log_input:
         log = ET.SubElement(root, 'Log', inBitDepth='32f', outBitDepth='32f', style='cameraLinToLog')
         ET.SubElement(log, 'LogParams', base='2',
@@ -900,10 +892,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
                       logSideSlope=repr(float(shaper['gs'])), logSideOffset=repr(float(shaper['go'])),
                       linSideBreak=repr(float(shaper['lb'])), linearSlope=repr(float(shaper['sl'])))
     if ranged:   # lattice spans shaper codes [c0, c1]: exact remap to the LUT3D's [0, 1]
-        rng = ET.SubElement(root, 'Range', inBitDepth='32f', outBitDepth='32f')
-        ET.SubElement(rng, 'Description').text = 'shaper code range [%r, %r] -> LUT3D domain' % (c0, c1)
-        for tag, val in (('minInValue', c0), ('maxInValue', c1), ('minOutValue', 0.0), ('maxOutValue', 1.0)):
-            ET.SubElement(rng, tag).text = repr(val)
+        add_range(root, c0, c1, 0.0, 1.0, 'shaper code range [%r, %r] -> LUT3D domain' % (c0, c1))
     lut = ET.SubElement(root, 'LUT3D', inBitDepth='32f', outBitDepth='32f', interpolation=interpolation)
     arr = ET.SubElement(lut, 'Array', dim='%d %d %d 3' % (n, n, n))
     if decode:
@@ -929,7 +918,7 @@ def write_clf(path, cube, shaper, nodes, interpolation, log_input, measured=None
             conform, conform, conform)
         root.find('OutputDescriptor').text += ' (conformed, see Interop)'
     if legal_out:   # last process node: full -> legal on the output code values
-        levels_range('legal output', 0.0, 1.0, LEGAL[0], LEGAL[1])
+        add_range(root, 0.0, 1.0, LEGAL[0], LEGAL[1], 'levels: legal output (remove this node for full range)', True)
     if legal_in:
         root.find('InputDescriptor').text += ' (legal range)'
     if legal_out:
@@ -1027,13 +1016,15 @@ if n is None:
 if not nodes:
     raise RuntimeError('Nothing between %s and %s to bake' % (n.name(), gen.name()))
 shaper_node = n
-fit_note = ''
+auto_note = ''
 log_input = bool(gen['log_input'].value())
-mode = gen['domain'].value()
-if mode != 'preset':
+if gen['domain'].value() == 'auto':
     # Probe the chain: seven ramps (neutral, 3 chromatic, 3 single-channel
     # negative), find where the output stops changing by more than a 10-bit
-    # step, then fit XLog to that (fit) or only if the preset falls short (auto).
+    # step, and if that is beyond the shaper's top (or a bounded floor below its
+    # floor), extend the lattice's code range to cover it with a stop of margin.
+    # The curve stays the preset (T-LogE by default); measured equal to fitting
+    # a new curve, and the file keeps one known encoding.
     sn = shaper_node
     sn['probe'].setValue(True)
     try:
@@ -1066,9 +1057,6 @@ if mode != 'preset':
         sn['probe'].setValue(False)
     if 'top' in unsat:
         top = 2.0 ** 15
-    if 'floor' in unsat:
-        floor = -0.5
-    # what the current shaper already covers (linear at code_max and code_min)
     gs, go, ls, lo, lb, sl = [sn[k].value() for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl')]
     logbreak = gs * math.log(ls * lb + lo, 2) + go
 
@@ -1078,63 +1066,17 @@ if mode != 'preset':
     def to_code(lin):
         return sl * lin + (logbreak - sl * lb) if lin < lb else gs * math.log(ls * lin + lo, 2) + go
 
-    have_top, have_floor = to_lin(sn['code_max'].value()), to_lin(sn['code_min'].value())
-    # an unbounded floor (DRTs keep desaturating negatives forever) is not a
-    # reason to fit: the shadow guard caps what a fit could give anyway
-    need = top > have_top or ('floor' not in unsat and floor < have_floor)
-    if log_input:
-        # the input encoding is fixed, so instead of refitting the curve the
-        # lattice spans a code range: top with one stop of margin, never below
-        # the encoding's own 1.0, capped at 1.5; floor only when bounded
-        c1 = max(1.0, min(1.5, to_code(2.0 * top)))
-        c0 = min(0.0, max(-0.1, to_code(2.0 * floor))) if 'floor' not in unsat else 0.0
-        if mode == 'fit' or need:
-            sn['code_min'].setValue(c0)
-            sn['code_max'].setValue(c1)
-            fit_note = ', fit: log input codes [%g, %g] (top %.4g -> code %.3g)' % (c0, c1, top, to_code(top))
-        else:
-            fit_note = ', auto: %s codes [%g, %g] cover it (top %.4g <= %.4g)' % (
-                sn['preset'].value(), sn['code_min'].value(), sn['code_max'].value(), top, have_top)
-        mode = 'keep'
+    # an unbounded floor (DRTs keep desaturating negatives forever) is not a reason to extend
+    c1 = max(1.0, min(1.5, to_code(2.0 * top)))
+    c0 = min(0.0, max(-0.1, to_code(2.0 * floor))) if 'floor' not in unsat else 0.0
+    if top > to_lin(1.0) or c0 < 0.0:
+        sn['code_min'].setValue(c0)
+        sn['code_max'].setValue(c1)
+        auto_note = ', auto: codes [%g, %g] (top %.4g)' % (c0, c1, top)
     else:
-        mode = 'fit' if mode == 'fit' or need else 'keep'
-        if mode == 'keep':
-            fit_note = ', auto: %s covers it (top %.4g <= %.4g, floor %.3g >= %.3g)' % (
-                sn['preset'].value(), top, have_top, floor, have_floor)
-if mode == 'fit':
-    sn['code_min'].setValue(0.0)   # the fitted XLog carries the range itself
-    sn['code_max'].setValue(1.0)
-    w0 = min(2.0 ** 16, max(1.0, 2.0 * top))
-    floor = 2.0 * floor
-    # XLog: w0 sets the top; solve k for the floor (lin value at code 0),
-    # keeping the linear toe's join at least 5 stops under grey.
-    o, x0, y0 = sn['o'].value(), sn['x0'].value(), sn['y0'].value()
-    o0 = -(2.0 ** -o)
-    s0 = (1.0 - y0) / math.log((w0 - o0) / (x0 - o0))
-    o1 = 1.0 - s0 * math.log(w0 - o0)
-
-    def floor_of(k):
-        return k * s0 * (1.0 - math.log(k * s0) - o1 / s0) + o0
-
-    k = sn['k'].value()
-    k_min = math.exp(-o1 / s0) / s0 * 1.01
-    k_max = (0.18 * 2.0 ** -5 - o0) / s0
-    if k_max > k_min:
-        if floor <= floor_of(k_max):
-            k = k_max
-        elif floor >= floor_of(k_min):
-            k = k_min
-        else:
-            lo_, hi_ = k_min, k_max
-            for _ in range(60):
-                mid = 0.5 * (lo_ + hi_)
-                lo_, hi_ = (mid, hi_) if floor_of(mid) > floor else (lo_, mid)
-            k = 0.5 * (lo_ + hi_)
-    sn['preset'].setValue(__XLOG__)
-    sn['w0'].setValue(w0)
-    sn['k'].setValue(k)
-    fit_note = ', fit: top %.4g -> w0 %.4g, floor %.3g -> %.3g (k %.3g)%s' % (
-        top, w0, floor / 2.0, floor_of(k), k, ' [unsaturated: %s]' % ' '.join(sorted(set(unsat))) if unsat else '')
+        sn['code_min'].setValue(0.0)
+        sn['code_max'].setValue(1.0)
+        auto_note = ', auto: %s covers it (top %.4g <= %.4g)' % (sn['preset'].value(), top, to_lin(1.0))
 shaper = dict((k, shaper_node[k].value()) for k in ('gs', 'go', 'ls', 'lo', 'lb', 'sl', 'w0', 'o', 'x0', 'y0', 'k',
                                                     'code_min', 'code_max'))
 shaper['preset'] = shaper_node['preset'].value()
@@ -1182,7 +1124,7 @@ os.remove(tmp)
 gen['file'].setValue(path)
 gen['status'].setValue('wrote %s (%d nodes, %d^3, %s%s)%s%s' % (
     os.path.basename(path), len(nodes), size, 'log input' if log_input else shaper['shortname'],
-    ', -> ' + target if decode else '', fit_note, decode_note))
+    ', -> ' + target if decode else '', auto_note, decode_note))
 '''
 
 
@@ -1370,10 +1312,9 @@ def build_shaper():
         d = nuke.Double_Knob(name, label)
         d.setRange(-0.5, 2.0)
         d.setValue(val)
-        d.setTooltip('Shaper code values the lattice spans. [0, 1] is the encoding\'s own range; a log input bake '
-                     'in a float pipeline may carry codes above 1.0 (S-Log3 code 1.0 is only 38 linear), so the '
-                     'top can be raised. Written to the CLF as an exact Range node. CLFGenerate\'s auto/fit sets '
-                     'it for log input bakes from what the chain still responds to.')
+        d.setTooltip('Shaper code values the lattice spans. [0, 1] is the encoding\'s own range (T-LogE tops out '
+                     'at scene 512); raise the top to bake content brighter than that. Written to the CLF as an '
+                     'exact Range node. CLFGenerate\'s auto sets it from what the chain still responds to.')
         if name == 'code_max':
             d.clearFlag(nuke.STARTLINE)
         g.addKnob(d)
@@ -1482,16 +1423,14 @@ def build_generate():
     k.setTooltip('Also store the baked nodes as a Nuke script inside the CLF so From CLF can rebuild them '
                  'exactly. The structured parameters, mastering and interop metadata are written regardless.')
     g.addKnob(k)
-    k = nuke.Enumeration_Knob('domain', 'domain', ['preset', 'auto', 'fit'])
-    k.setTooltip('preset: use the shaper as set on CLFShaper.\n'
+    k = nuke.Enumeration_Knob('domain', 'domain', ['preset', 'auto'])
+    k.setTooltip('preset: use the shaper and code range as set on CLFShaper.\n'
                  'auto: probe the chain with exposure ramps; if its output still changes by more than a '
-                 '10-bit step beyond the preset\'s top or floor, replace the preset with a fitted XLog.\n'
-                 'fit: always fit. XLog gets w0 one stop above where the output stops changing and a '
-                 'linear toe reaching the negative floor. A fitted XLog is written to the CLF exactly, '
-                 'like any preset, and the status line reports what was found.')
+                 '10-bit step above the shaper\'s top, extend the code range to cover it (with a stop of '
+                 'margin) and write that to CLFShaper. The curve stays the same.')
     g.addKnob(k)
     k = nuke.PyScript_Knob('generate', 'Generate', script(
-        GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS])).replace('__XLOG__', str(XLOG))))
+        GENERATE.replace('__SHORT__', repr([p[1] for p in PRESETS]))))
     k.setFlag(nuke.STARTLINE)
     k.setTooltip('Bake the chain to a 3D LUT via GenerateLUT, then write the CLF with the shaper and node parameters embedded.')
     g.addKnob(k)

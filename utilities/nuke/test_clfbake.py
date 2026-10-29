@@ -1,7 +1,7 @@
 """Headless verification of CLFBake.nk against the OpenDRT Nuke node.
 
-    rez-env nuke fxphd -- nuke -t test_clfbake.py
-    CLFBAKE_PRESET=8 rez-env nuke fxphd -- nuke -t test_clfbake.py   # other shaper presets
+    nuke -t test_clfbake.py
+    CLFBAKE_PRESET=8 nuke -t test_clfbake.py   # other shaper presets
 
 Builds: test image -> CLFShaper -> OpenDRT -> CLFGenerate, presses Generate,
 then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
@@ -12,7 +12,8 @@ then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
   4. Restore applies the recorded OpenDRT parameters to a fresh node,
   5. the same bake written as CTF loads,
   6. the thin Bake CLF / Restore CLF buttons on OpenDRT itself do the same,
-  7. domain auto keeps a sufficient preset, fit replaces it and clamps exactly,
+  7. domain auto keeps a shaper that covers the chain, else extends its code
+     range, and the extended bake matches Nuke above the old top,
   8. From CLF rebuilds the chain from the script the CLF carries, and baking
      that rebuilt chain reproduces the original CLF's Log parameters and LUT
      array byte for byte, for both the standalone and the OpenDRT-button CLF.
@@ -21,8 +22,10 @@ the CLF with xml.etree. Exits non-zero on failure.
 """
 import math
 import os
+import re
 import sys
 import tempfile
+import xml.etree.ElementTree as ET
 
 import nuke
 import PyOpenColorIO as ocio
@@ -70,7 +73,6 @@ def max_err(a, b):
 
 def clf_core(path):
     """(LogParams attributes or None, LUT3D array rows, recorded knob values) for byte comparison."""
-    import xml.etree.ElementTree as ET
     root = ET.parse(path).getroot()
     lp = root.find('Log/LogParams')
     rows = [l.split() for l in root.find('LUT3D/Array').text.strip().splitlines()]
@@ -219,45 +221,46 @@ if bad:
 txt2 = open(clf2).read()
 assert clf2 not in txt2 and '<Knob name="clf_file">' not in txt2, 'the bake path must not be recorded'
 
-# --- 7. domain: auto keeps a sufficient preset, fit replaces it ---------------
+# --- 7. domain auto: keeps a shaper that covers the chain, else extends its code range ---
 shaper['preset'].setValue(len(shaper['preset'].values()) - 1)   # XLog
 shaper['w0'].setValue(60000.0)
 gen['file'].setValue(os.path.join(OUT, 'test_auto.clf'))
 gen['domain'].setValue('auto')
 gen['generate'].execute()
 print('status:', gen['status'].value())
-ok = 'auto: XLog covers it' in gen['status'].value() and shaper['w0'].value() == 60000.0
-print('%s auto keeps a sufficient preset' % ('PASS' if ok else 'FAIL'))
+ok = 'auto: XLog covers it' in gen['status'].value() and shaper['code_max'].value() == 1.0
+print('%s auto keeps a shaper that covers the chain' % ('PASS' if ok else 'FAIL'))
 if not ok:
     failures.append('auto keep')
 shaper['preset'].setValue(PRESET)
 shaper['w0'].setValue(128.0)
-clf_fit = os.path.join(OUT, 'test_fit.clf')
-gen['file'].setValue(clf_fit)
-gen['domain'].setValue('fit')
+gen['file'].setValue(OUT + '/')
 gen['generate'].execute()
 gen['domain'].setValue('preset')
+clf_ext = gen['file'].value()
 print('status:', gen['status'].value())
-assert shaper['preset'].value() == 'XLog', shaper['preset'].value()
-hi_f, lo_f = log_to_lin(shaper, 1.0), log_to_lin(shaper, 0.0)
-print('fit domain: %.4g .. %.4g  (w0 %.4g, k %.4g)' % (lo_f, hi_f, shaper['w0'].value(), shaper['k'].value()))
-img3 = test_image(hi_f, lo_f, 'TestImageFit')
+c1 = shaper['code_max'].value()
+root_x = ET.parse(clf_ext).getroot()
+rng_x = root_x.find('Range')
+in_x = root_x.find('Info/CLFBake/Interop').get('input')
+ok = c1 > 1.0 and root_x.find('Log') is not None and rng_x is not None \
+    and abs(float(rng_x.find('maxInValue').text) - c1) < 1e-9 and '|codes' not in in_x and '-to' in os.path.basename(clf_ext)
+print('%s auto extends the code range: codes 0..%.4g, Range node %s, input %s\n   %s' % (
+    'PASS' if ok else 'FAIL', c1, 'present' if rng_x is not None else 'MISSING', in_x, os.path.basename(clf_ext)))
+if not ok:
+    failures.append('auto extend')
+hi_x = log_to_lin(shaper, c1)
+img3 = test_image(hi_x, lo, 'TestImageExtended')
 shaper.setInput(0, img3)
-check('fit: CLF vs Nuke', max_err(apply_clf(clf_fit, sample(img3, W, H)), sample(gen, W, H)), IMAGE_TOL)
-# beyond the fitted domain the chain must already be flat, so clamping is harmless
-c = nuke.nodes.Expression(expr0=repr(hi_f * 8), expr1=repr(hi_f * 8), expr2=repr(hi_f * 8))
+check('auto: CLF vs Nuke up to the extended top (%.0f)' % hi_x, max_err(apply_clf(clf_ext, sample(img3, W, H)), sample(gen, W, H)), IMAGE_TOL)
+# beyond the extended top the chain must already be flat, so clamping is harmless
+c = nuke.nodes.Expression(expr0=repr(hi_x * 8), expr1=repr(hi_x * 8), expr2=repr(hi_x * 8))
 c.setInput(0, None)
 shaper.setInput(0, c)
 live = [[gen.sample(ch, 0.5, 0.5) for ch in ('red', 'green', 'blue')]]
-check('fit: 3 stops above top', max_err(apply_clf(clf_fit, [[hi_f * 8] * 3]), live), 5e-3)
-# 2 stops below the floor on one channel: left half red, right half blue
-# (an image rather than single pixels: constant negative sources sample
-# black in Nuke 15.1 -t)
-c = nuke.nodes.Expression(expr0='x<width/2?%r:0.18' % (lo_f * 4), expr1='0.18',
-                          expr2='x<width/2?0.18:%r' % (lo_f * 4))
-c.setInput(0, None)
-shaper.setInput(0, c)
-check('fit: 2 stops below floor', max_err(apply_clf(clf_fit, sample(c, W, H)), sample(gen, W, H)), IMAGE_TOL)
+check('auto: 3 stops above the extended top', max_err(apply_clf(clf_ext, [[hi_x * 8] * 3]), live), 5e-3)
+shaper['code_min'].setValue(0.0)
+shaper['code_max'].setValue(1.0)
 shaper.setInput(0, img)
 
 # --- 8. From CLF rebuilds the chain; re-baking reproduces the CLF ---------------
@@ -289,7 +292,6 @@ rebake_matches('standalone', clf)          # T-LogE 48^3, the first bake of this
 rebake_matches('opendrt button', clf2)     # the OpenDRT button's own bake
 
 # --- 9. model / mastering / interop metadata --------------------------------------
-import xml.etree.ElementTree as ET
 
 
 def meta_checks(name, path, node, expect_out, expect_cicp, grey_nits, in_id=None, conform=None, tail=None):
@@ -409,7 +411,6 @@ meta_checks('linear xyz 1000nit', clf_lx, d4, 'ocio:lin_ciexyzd65_display', ('10
             conform=10.0, tail=d4)
 
 # --- 10. automatic file name and the parameter string --------------------------------
-import re
 
 
 def auto_bake(g, d, label):
@@ -422,7 +423,7 @@ def auto_bake(g, d, label):
 
 
 # drt is modified (tn_con, hs_r, ...), tn_Lp 200: expect a hash, not a look name
-shaper['preset'].setValue(0)   # back to T-LogE after the fit section
+shaper['preset'].setValue(0)   # back to T-LogE after the auto section
 auto_path, base = auto_bake(gen, drt, 'modified node')
 pat = r'OpenDRT-v1\.1\.0_[0-9a-f]{8}_video200__lin_egamut__to__g24_rec709__48\.clf$'
 ok_mod = re.match(pat, base) is not None and os.path.exists(auto_path)
@@ -520,7 +521,7 @@ shaper['preset'].setValue(0)
 shaper['code_min'].setValue(0.0)
 shaper['code_max'].setValue(1.0)
 gen['log_input'].setValue(True)
-gen['domain'].setValue('fit')
+gen['domain'].setValue('auto')
 gen['format'].setValue('clf')
 gen['file'].setValue(OUT + '/')
 gen['generate'].execute()
@@ -532,7 +533,8 @@ root_r = ET.parse(clf_rng).getroot()
 rng = root_r.find('Range')
 in_id_r = root_r.find('Info/CLFBake/Interop').get('input')
 ok_rng = cmax > 1.0 and rng is not None and abs(float(rng.find('maxInValue').text) - cmax) < 1e-9 \
-    and root_r.find('Log') is None and '|codes' in in_id_r and '-codes' not in os.path.basename(clf_rng)
+    and root_r.find('Log') is None and '|codes' in in_id_r and '-codes' not in os.path.basename(clf_rng) \
+    and '-to' in os.path.basename(clf_rng)
 print('%s log input code range: code_max %.3f, Range node %s, input %s\n   %s' % (
     'PASS' if ok_rng else 'FAIL', cmax, 'present' if rng is not None else 'MISSING', in_id_r, os.path.basename(clf_rng)))
 if not ok_rng:
