@@ -139,9 +139,16 @@ With `log input` there is no shaper. This is the one place the nodes import
 PyOpenColorIO, which Nuke bundles. One caveat for OpenColorIO as a consumer: its `.csp` reader resamples the prelut into a uniform 65,536-entry
 1D LUT across the prelut's input range, which for a 512-linear top means one
 sample per 0.0078 linear and a visible loss in the shadows (measured 3e-3 at
-−5 stops, 1e-2 worst case on the harness image). Hosts that interpolate the
-prelut on its given points reproduce the shaper to about 1e-7. Give OCIO the
-CLF.
+−5 stops, 1e-2 worst case on the harness image). It gets much worse as the
+shaper's top rises, because the sample step scales with it: a fitted XLog
+with a 13,877 top, which an HDR or `fit` bake gets, puts one sample every
+0.21 linear, and OCIO's reading of that csp is off by 0.26 code in the
+0.1 to 1.0 band against 8e-3 for the same bake's CLF. A csp with a high
+shaper top is unusable through OpenColorIO. Hosts that interpolate the
+prelut on its given points reproduce the shaper to about 1e-7 at any top.
+Give OCIO the CLF. (The fix belongs in OCIO's reader, which could resample
+the prelut onto a half-float domain instead; the source carries a TODO
+there.)
 
 **Code range for log input.** A log encoding's own range, codes 0 to 1, tops
 out low in linear for some encodings: S-Log3 at 38, LogC3 at 55, ACEScct at
