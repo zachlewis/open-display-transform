@@ -31,7 +31,7 @@ OpenDRT for Nuke is provided as a group node. To load it, just drag and drop the
 
 [![OpenDRT Nuke Installation and Usage](https://github.com/user-attachments/assets/6e0e91c8-d9f2-4568-8840-19e00f94103b)](https://www.youtube.com/watch?v=RYmANRwCNc4)
 
-The Nuke node's "CLF Helpers" group bakes the current settings to a CLF (T-LogE shaper at 48³, the same recipe as the OCIO config below) with the parameters embedded, and restores them from such a file. For other shapers, lattice sizes, or baking a whole chain of nodes, see [utilities/nuke](../../utilities/nuke/README.md).
+The Nuke node's "CLF Helpers" bake its settings to a CLF (T-LogE, 48³, as in the OCIO config below) and restore them. They need [utilities/nuke](../../utilities/nuke/README.md) on `NUKE_PATH`, which also has a tool for other shapers, sizes and node chains.
 
 
 ### OpenColorIO

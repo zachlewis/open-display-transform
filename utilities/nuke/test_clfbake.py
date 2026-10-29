@@ -1,24 +1,14 @@
-"""Headless verification of CLFBake.nk against the OpenDRT Nuke node.
+"""Headless checks of CLFBake against the OpenDRT Nuke node, with PyOpenColorIO
+as the independent reader.
 
     nuke -t test_clfbake.py
-    CLFBAKE_PRESET=8 nuke -t test_clfbake.py   # other shaper presets
+    CLFBAKE_PRESET=8 nuke -t test_clfbake.py   # another shaper preset
 
-Builds: test image -> CLFShaper -> OpenDRT -> CLFGenerate, presses Generate,
-then checks that applying the CLF with PyOpenColorIO matches what Nuke renders:
-  1. on the lattice (pattern mode) the match must be exact (shaper + LUT agree),
-  2. off the lattice (real image) the match must be within 3D LUT interpolation
-     error,
-  3. a log-input CLF applied to log-encoded values matches too,
-  4. Restore applies the recorded OpenDRT parameters to a fresh node,
-  5. the same bake written as CTF loads,
-  6. the thin Bake CLF / Restore CLF buttons on OpenDRT itself do the same,
-  7. domain auto keeps a shaper that covers the chain, else extends its code
-     range, and the extended bake matches Nuke above the old top,
-  8. From CLF rebuilds the chain from the script the CLF carries, and baking
-     that rebuilt chain reproduces the original CLF's Log parameters and LUT
-     array byte for byte, for both the standalone and the OpenDRT-button CLF.
-PyOpenColorIO is used here only as the independent reader; the nodes write
-the CLF with xml.etree. Exits non-zero on failure.
+Bakes test image -> CLFShaper -> OpenDRT -> CLFGenerate and compares the files
+with Nuke's render: on and off the lattice, log input, CTF, csp, linear
+decodes, levels, the auto code range, Restore / Apply Params / From CLF round
+trips, file names and metadata. One PASS/FAIL line per check; exits non-zero
+on failure.
 """
 import math
 import os
@@ -31,6 +21,7 @@ import nuke
 import PyOpenColorIO as ocio
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
+sys.path.insert(0, HERE)   # the buttons import clfbake
 ROOT = os.path.abspath(os.path.join(HERE, '..', '..'))
 CLFBAKE = os.path.join(HERE, 'CLFBake.nk')
 OPENDRT = os.path.join(ROOT, 'display-transforms', 'opendrt', 'OpenDRT.nk')
