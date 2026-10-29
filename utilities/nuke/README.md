@@ -183,6 +183,26 @@ shaper-to-input, so the forward transform must be the decode direction
 (codes to linear). Some references state the opposite; the harness checks
 the prelut points against the CLF's Log node, which settles it.
 
+Why not an equalised shaper. A shaper fitted to the chain can keep T-LogE as
+the file's public input: T-LogE Log node, then a LUT1D remap from T-LogE code
+to the equalised code, then the cube baked under the equalised shaper. The
+remap is a smooth monotonic curve on 0 to 1, which every reader handles
+exactly. Measured at 48³ with the lattice density proportional to the square
+root of the chain's curvature along seven ramps (neutral, primaries,
+secondaries), clipped to a range around uniform:
+
+| density range | SDR 2.4 max / p99 | PQ 1000 max / p99 |
+|---|---|---|
+| T-LogE (uniform) | 1.6e-2 / 4.0e-3 | 7.2e-3 / 1.5e-3 |
+| 0.8 to 1.25x | 1.9e-2 / 3.3e-3 | 4.8e-3 / 1.2e-3 |
+| 0.67 to 1.5x | 2.9e-2 / 4.4e-3 | 3.8e-3 / 1.7e-3 |
+| 0.5 to 2x | 4.7e-2 / 6.0e-3 | 4.9e-3 / 2.3e-3 |
+
+The gentlest setting buys about 15% at p99 and moves the maximum either way;
+anything stronger loses, because the error that remains is the chain moving
+across the lattice, which a per-axis curve cannot follow. 65³ halves the
+error. Not worth a probe step and an extra node in every file.
+
 **Automatic file names.** When `file` is a directory (or empty), the name is
 explicit and deterministic, never random:
 
