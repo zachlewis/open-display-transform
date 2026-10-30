@@ -792,6 +792,152 @@ if not ok_e:
 gen['output'].setValue('display codes'); g3['output'].setValue('display codes')
 
 
+# --- 15. ODT node: lin_ciexyzd65_display <-> the CIF display colorspaces --------------
+# (a) the node against OCIO, display by display: the CIF config's transforms rebuilt
+#     from OCIO operators with independently computed matrices (OCIO 2.2/2.3 lack the
+#     HLG OETF builtin, so that last step is BT.2100 of E/3, as OCIO 2.4 defines it)
+import clfbake
+XYT['Rec.2020'] = XYT['Rec.2020 (P3 Limited)']
+XYT['AdobeRGB'] = ((0.64, 0.33), (0.21, 0.71), (0.15, 0.06), (0.3127, 0.3290))
+I3 = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]
+
+
+def hlg_oetf3(x):
+    a = 0.17883277
+    b, c = 1 - 4 * a, 0.5 - a * math.log(4 * a)
+    e = abs(x) / 3.0
+    return math.copysign(math.sqrt(3 * e) if e <= 1 / 12. else a * math.log(12 * e - b) + c, x)
+
+
+def cif_forward(d):
+    m = t_inv(t_npm(*XYT[d[2]])) if d[2] else I3
+    m = [[v * d[5] for v in row] for row in m]
+    ts = [ocio.MatrixTransform([m[0][0], m[0][1], m[0][2], 0, m[1][0], m[1][1], m[1][2], 0,
+                                m[2][0], m[2][1], m[2][2], 0, 0, 0, 0, 1])]
+    if d[3] == 'gamma':
+        ts.append(ocio.ExponentTransform([d[4]] * 3 + [1.0], negativeStyle=ocio.NEGATIVE_MIRROR,
+                                         direction=ocio.TRANSFORM_DIR_INVERSE))
+    elif d[3] == 'srgb':
+        ts.append(ocio.ExponentWithLinearTransform([2.4] * 3 + [1.0], [0.055] * 3 + [0.0], negativeStyle=ocio.NEGATIVE_MIRROR,
+                                                   direction=ocio.TRANSFORM_DIR_INVERSE))
+    elif d[3] == 'pq':
+        ts.append(ocio.BuiltinTransform('CURVE - LINEAR_to_ST-2084'))
+    elif d[3] == 'hlg':
+        ts.append(ocio.FixedFunctionTransform(ocio.FIXED_FUNCTION_REC2100_SURROUND, [1 / 1.2]))
+    if d[3] == 'pq':   # OCIO < 2.4 clamps negatives in this builtin; the CIF config (2.4+) mirrors
+        pq = ocio.Config.CreateRaw().getProcessor(ts.pop()).getOptimizedCPUProcessor(ocio.OPTIMIZATION_NONE)
+    cpu = ocio.Config.CreateRaw().getProcessor(ocio.GroupTransform(ts)).getOptimizedCPUProcessor(ocio.OPTIMIZATION_NONE)
+    if d[3] == 'hlg':
+        return lambda p: [hlg_oetf3(v) for v in cpu.applyRGB(list(p))]
+    if d[3] == 'pq':
+        return lambda p: [math.copysign(pq.applyRGB([abs(v)] * 3)[0], v) for v in cpu.applyRGB(list(p))]
+    return lambda p: cpu.applyRGB(list(p))
+
+
+probes = []
+for y in (0.0001, 0.01, 0.18, 1.0, 2.03, 10.0, 100.0):            # 1.0 = 100 cd/m2
+    probes += [[0.9505 * y, y, 1.089 * y], [0.4124 * y, 0.2126 * y, 0.0193 * y], [0.3 * y, 0.5 * y, 0.9 * y]]
+probes.append([-0.05, 0.02, 0.01])
+NP = len(probes)
+nuke.addFormat('%d 1 0 0 %d 1 1 clfbake_odt_probe' % (NP, NP))
+pc = nuke.nodes.Constant()
+pc['format'].setValue('clfbake_odt_probe')
+psrc = nuke.nodes.Expression(inputs=[pc])
+o1 = paste(os.path.join(HERE, 'ODT.nk'))[0]
+o1.setInput(0, psrc)
+
+
+def run_odt(values):
+    for c in range(3):
+        psrc['expr%d' % c].setValue('+'.join('(x>=%d&&x<%d?%r:0)' % (i, i + 1, v[c]) for i, v in enumerate(values)))
+    o1.sample('red', 0.5, 0.5)
+    return [[o1.sample(ch, i + 0.5, 0.5) for ch in ('red', 'green', 'blue')] for i in range(NP)]
+
+
+def rel_floor(a, b):
+    return max(abs(x - y) / max(abs(y), 1e-3) for pa, pb in zip(a, b) for x, y in zip(pa, pb))
+
+
+worst = (0.0, '')
+for i, d in enumerate(clfbake.DISPLAYS):
+    ref = cif_forward(d)
+    enc = [ref(p) for p in probes]
+    o1['display'].setValue(i)
+    o1['direction'].setValue('forward')
+    e_f = rel_floor(run_odt(probes), enc)
+    o1['direction'].setValue('inverse')
+    e_i = rel_floor(run_odt(enc), probes)
+    worst = max(worst, (max(e_f, e_i), d[0]))
+    if max(e_f, e_i) > 2e-4:
+        print('FAIL odt %s: forward %.2e inverse %.2e' % (d[0], e_f, e_i))
+        failures.append('odt ' + d[0])
+print('%s odt node vs OCIO, 16 displays forward and inverse: worst %.2e (%s) (tol 2e-4)' % (
+    'PASS' if worst[0] <= 2e-4 else 'FAIL', worst[0], worst[1]))
+
+# (b) ODT nodes at the end of a chain are written as exact process nodes. OpenDRT
+#     Rec.1886 -> ODT inverse -> ODT forward lin_rec709 equals the output menu's lin_rec709
+ix = dict((d[0].split(':')[-1], i) for i, d in enumerate(clfbake.DISPLAYS))
+o2 = paste(os.path.join(HERE, 'ODT.nk'))[0]
+o1['display'].setValue(ix['g24_rec709_display']); o1['direction'].setValue('inverse')
+o2['display'].setValue(ix['lin_rec709_display']); o2['direction'].setValue('forward')
+o1.setInput(0, drt); o2.setInput(0, o1); gen.setInput(0, o2)
+gen['file'].setValue(OUT + '/')
+gen['generate'].execute()
+clf_o = gen['file'].value()
+r = ET.parse(clf_o).getroot()
+tags = node_tags(clf_o)
+ok = tags == ['Log[cameraLinToLog]', 'LUT3D', 'Exponent[basicMirrorFwd]'] \
+    and r.find('Info/CLFBake/Interop').get('output') == 'lin_rec709_display' \
+    and not o1['disable'].value() and not o2['disable'].value() and '__to__lin_rec709__' in os.path.basename(clf_o)
+print('%s odt tail -> exact ops: %s %s' % ('PASS' if ok else 'FAIL', tags, os.path.basename(clf_o)))
+if not ok:
+    failures.append('odt tail structure')
+for n in (img, shaper, drt, o1, o2, gen):
+    n.sample('red', 0.5, 0.5)
+check('odt tail: CLF vs Nuke (rel to 2.0)', rel_err(apply_clf(clf_o, lin), sample(gen, W, H), 2.0), IMAGE_TOL)
+check('odt tail = output menu lin_rec709 (rel to 2.0)', rel_err(apply_clf(clf_o, lin), apply_clf(clf_lin, lin), 2.0), 1e-6)
+# (c) HDR: PQ Rec.2020 -> ODT inverse -> ODT forward sRGB, as CLF and as CTF 2.4
+d4['eotf'].setValue('PQ'); d4['display_gamut'].setValue('Rec.2020 (P3 Limited)'); d4['tn_Lp'].setValue(1000)
+o1['display'].setValue(ix['pq_rec2020_display']); o1['direction'].setValue('inverse')
+o2['display'].setValue(ix['srgb_rec709_display']); o2['direction'].setValue('forward')
+o1.setInput(0, d4); g3.setInput(0, o2)
+g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+clf_h = g3['file'].value()
+tags = node_tags(clf_h)
+ok = tags == ['Log[cameraLinToLog]', 'LUT3D', 'LUT1D[half]', 'Matrix', 'Exponent[monCurveMirrorRev]']
+print('%s odt tail HDR -> sRGB: %s' % ('PASS' if ok else 'FAIL', tags))
+if not ok:
+    failures.append('odt tail HDR structure')
+for n in (img, s3, d4, o1, o2, g3):
+    n.sample('red', 0.5, 0.5)
+check('odt tail HDR: CLF vs Nuke (rel to 3.0)', rel_err(apply_clf(clf_h, lin), sample(g3, W, H), 3.0), IMAGE_TOL)
+g3['format'].setValue('ctf'); g3['ocio'].setValue('2.4'); g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+tags = node_tags(g3['file'].value())
+ok = tags == ['Log[cameraLinToLog]', 'LUT3D', 'FixedFunction[PQ_TO_Lin]', 'Matrix', 'Exponent[monCurveMirrorRev]'] \
+    and ET.parse(g3['file'].value()).getroot().get('version') == '2.4'
+print('%s odt tail HDR as CTF 2.4: %s' % ('PASS' if ok else 'FAIL', tags))
+if not ok:
+    failures.append('odt tail CTF 2.4')
+g3['format'].setValue('clf'); g3['ocio'].setValue('2.1')
+# (d) an HLG ODT has no CLF operator: it is baked, and still names the output
+o2['display'].setValue(ix['hlg_rec2020_display'])
+g3['file'].setValue(OUT + '/')
+g3['generate'].execute()
+r = ET.parse(g3['file'].value()).getroot()
+cicp = r.find('Info/CLFBake/Mastering/CICP')
+ok = node_tags(g3['file'].value()) == ['Log[cameraLinToLog]', 'LUT3D'] \
+    and r.find('Info/CLFBake/Interop').get('output').split(':')[-1].startswith('hlg_rec2020_display') \
+    and cicp is not None and (cicp.get('primaries'), cicp.get('transfer')) == ('9', '18')
+print('%s odt HLG is baked and names the output: %s' % ('PASS' if ok else 'FAIL', os.path.basename(g3['file'].value())))
+if not ok:
+    failures.append('odt HLG')
+gen.setInput(0, drt); g3.setInput(0, d4)
+for n in (o1, o2, psrc, pc):
+    nuke.delete(n)
+
+
 print('outputs in', OUT)
 if failures:
     print('FAILED:', failures)

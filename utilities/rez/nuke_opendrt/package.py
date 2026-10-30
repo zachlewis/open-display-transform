@@ -7,12 +7,13 @@ version = '26.10.28.0'
 description = \
     """
     OpenDRT for Nuke (Jed Smith's open-display-transform) plus CLFBake: the
-    OpenDRT v1.1 node with its CLF Helpers, and the CLFShaper / CLFGenerate
-    pair that bakes any node chain to a CLF or CTF with a parametric log
-    shaper and restorable metadata.
+    OpenDRT v1.1 node with its CLF Helpers, the CLFShaper / CLFGenerate pair
+    that bakes any node chain to a CLF, CTF or csp with a parametric log
+    shaper and restorable metadata, and an ODT node between
+    lin_ciexyzd65_display and the CIF / OCIO 2 display colorspaces.
 
-    Delivered as Nuke ToolSets (Nodes > ToolSets > OpenDRT), so pasting needs
-    no Python. The DCTLs, docs and the headless test harness ship alongside
+    Delivered as Nuke ToolSets (Nodes > ToolSets > OpenDRT); clfbake.py, which
+    the buttons import, is on NUKE_PATH. The DCTLs, docs and the headless test harness ship alongside
     under {root}/display-transforms and {root}/utilities for reference;
     `rez-test nuke_opendrt` runs the harness in the resolved Nuke.
     """

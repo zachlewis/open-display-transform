@@ -2,7 +2,7 @@
 install path. Run by rez (`rez-build -i` here); the repo root is three levels up.
 
 Layout installed:
-  nuke/ToolSets/OpenDRT/OpenDRT.nk, CLFBake.nk   what Nuke's ToolSets menu shows
+  nuke/ToolSets/OpenDRT/OpenDRT.nk, CLFBake.nk, ODT.nk   what Nuke's ToolSets menu shows
   display-transforms/opendrt/                     OpenDRT.nk, .dctl, README, docs
   utilities/nuke/                                 CLFBake.nk, builder, test harness, README
   utilities/*.dctl, LICENSE, README.md
@@ -27,6 +27,7 @@ COPY = [
 TOOLSETS = {
     'nuke/ToolSets/OpenDRT/OpenDRT.nk': 'display-transforms/opendrt/OpenDRT.nk',
     'nuke/ToolSets/OpenDRT/CLFBake.nk': 'utilities/nuke/CLFBake.nk',
+    'nuke/ToolSets/OpenDRT/ODT.nk': 'utilities/nuke/ODT.nk',
 }
 
 
