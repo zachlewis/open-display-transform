@@ -12,7 +12,8 @@ import nuke
 
 HERE = os.path.dirname(os.path.abspath(sys.argv[0]))
 sys.path.insert(0, HERE)
-from clfbake import PRESETS, XLOG, XLOG_DEFAULTS, auto_slope, inverse_expr  # noqa: E402
+from clfbake import (PRESETS, XLOG, XLOG_DEFAULTS, DISPLAYS, ODT_MARK, auto_slope, inverse_expr,  # noqa: E402
+                     display_matrix, moncurve)
 
 OPENDRT = os.path.join(HERE, '..', '..', 'display-transforms', 'opendrt', 'OpenDRT.nk')
 
@@ -263,6 +264,112 @@ def splice_opendrt(path, new):
     open(path, 'w').write('\n'.join(lines) + '\n')
 
 
+# --- ODT: lin_ciexyzd65_display <-> the CIF / OCIO 2 display colorspaces ------------
+ENC = ('linear', 'gamma', 'srgb', 'pq', 'hlg')
+M1, M2, C1, C2, C3 = 2610 / 16384., 2523 / 32., 107 / 128., 2413 / 128., 2392 / 128.
+HA = 0.17883277
+HB, HC = 1 - 4 * HA, 0.5 - HA * __import__('math').log(4 * HA)
+BRK, SLOPE = moncurve(2.4, 0.055)
+
+
+def pick(values):
+    """Nested ternary over the display menu."""
+    expr = '%.17g' % values[-1]
+    for i in range(len(values) - 2, -1, -1):
+        expr = 'display==%d?%.17g:(%s)' % (i, values[i], expr)
+    return expr
+
+
+def coding(x, decode):
+    """Per-channel encode (forward) or decode (inverse) expression; HLG's surround is separate."""
+    if decode:
+        cases = (x, 'sign(%s)*pow(fabs(%s),parent.gm)' % (x, x),
+                 'sign(%s)*(fabs(%s)>=%r?pow((fabs(%s)+0.055)/1.055,2.4):fabs(%s)*%r)' % (x, x, BRK, x, x, SLOPE),
+                 'sign(%s)*100*pow(max(pow(fabs(%s),%r)-%r,0)/(%r-%r*pow(fabs(%s),%r)),%r)' % (
+                     x, x, 1 / M2, C1, C2, C3, x, 1 / M2, 1 / M1),
+                 'sign(%s)*(fabs(%s)<=0.5?%s*%s:(exp((fabs(%s)-%r)/%r)+%r)/4)' % (x, x, x, x, x, HC, HA, HB))
+    else:
+        h = '(%s*pow(Y,1/1.2-1)/3)' % x
+        cases = (x, 'sign(%s)*pow(fabs(%s),1/parent.gm)' % (x, x),
+                 'sign(%s)*(fabs(%s)>=%r?1.055*pow(fabs(%s),1/2.4)-0.055:fabs(%s)/%r)' % (x, x, BRK * SLOPE, x, x, SLOPE),
+                 'sign(%s)*pow((%r+%r*pow(fabs(%s)*0.01,%r))/(1+%r*pow(fabs(%s)*0.01,%r)),%r)' % (
+                     x, C1, C2, x, M1, C3, x, M1, M2),
+                 'sign(%s)*(fabs(%s)<=1/12.?sqrt(3*fabs(%s)):%r*log(12*fabs(%s)-%r)+%r)' % (h, h, h, HA, h, HB, HC))
+    return ''.join('parent.enc==%d?(%s):' % (i, c) for i, c in enumerate(cases[:-1])) + '(%s)' % cases[-1]
+
+
+def build_odt():
+    g = nuke.nodes.Group(name='ODT')
+    g.begin()
+    inp = nuke.nodes.Input(name='Input1')
+    to_rgb = nuke.nodes.ColorMatrix(name='ToDisplayRGB', inputs=[inp])
+    enc = nuke.nodes.Expression(name='Encode', inputs=[to_rgb])
+    dec = nuke.nodes.Expression(name='Decode', inputs=[inp])
+    sur = nuke.nodes.Expression(name='HLGSurroundInverse', inputs=[dec])
+    from_rgb = nuke.nodes.ColorMatrix(name='FromDisplayRGB', inputs=[sur])
+    from_rgb['invert'].setValue(True)
+    for cm in (to_rgb, from_rgb):
+        for k in range(9):
+            cm['matrix'].setExpression('parent.m%d' % k, k)
+    # HLG: Rec.2100 surround with the 1000 cd/m2 nominal display (gamma 1.2), luminance
+    # clamped at 1e-4 in magnitude as OCIO does, then the OETF of E/3; the inverse
+    # clamps where that forward clamp lands, 1e-4^(1/1.2)
+    y = 'max(fabs(0.2627*r+0.6780*g+0.0593*b),%r)'
+    enc['temp_name0'].setValue('Y')
+    enc['temp_expr0'].setValue(y % 1e-4)
+    sur['temp_name0'].setValue('Y')
+    sur['temp_expr0'].setValue(y % (1e-4 ** (1 / 1.2)))   # the forward clamp, carried through
+    for i, c in enumerate('rgb'):
+        enc['expr%d' % i].setValue(coding(c, False))
+        dec['expr%d' % i].setValue(coding(c, True))
+        sur['expr%d' % i].setValue('parent.enc==4?%s*pow(Y,0.2):%s' % (c, c))
+    sw = nuke.nodes.Switch(name='Direction', inputs=[enc, from_rgb])
+    sw['which'].setExpression('parent.direction')
+    nuke.nodes.Output(name='Output1', inputs=[sw])
+    g.end()
+
+    g.addKnob(nuke.Tab_Knob('ODT'))
+    k = nuke.Enumeration_Knob('display', 'display', [d[1] for d in DISPLAYS])
+    k.setTooltip('Display colorspace, as defined by the Color Interop Forum display config (OCIO 2): ' +
+                 ', '.join(d[0] for d in DISPLAYS) + '.')
+    g.addKnob(k)
+    k = nuke.Enumeration_Knob('direction', 'direction', ['forward', 'inverse'])
+    k.setTooltip('forward: lin_ciexyzd65_display (1.0 = 100 cd/m2) to the display. inverse: the display back to '
+                 'lin_ciexyzd65_display. CLFGenerate writes ODT nodes at the end of a chain as exact CLF ops.')
+    g.addKnob(k)
+    g.addKnob(nuke.Tab_Knob('Params'))
+    ms = [display_matrix(d) for d in DISPLAYS]
+    for k in range(9):
+        d = nuke.Double_Knob('m%d' % k, 'm%d' % k)
+        d.setExpression(pick([m[k // 3][k % 3] for m in ms]))
+        d.setFlag(nuke.DISABLED)
+        g.addKnob(d)
+    for name, vals in (('enc', [ENC.index(d[3]) for d in DISPLAYS]), ('gm', [d[4] or 1.0 for d in DISPLAYS])):
+        d = nuke.Double_Knob(name, name)
+        d.setExpression(pick(vals))
+        d.setFlag(nuke.DISABLED)
+        g.addKnob(d)
+    k = nuke.String_Knob(ODT_MARK, '', '1')
+    k.setFlag(nuke.INVISIBLE)
+    g.addKnob(k)
+    g.addKnob(nuke.Tab_Knob('About'))
+    g.addKnob(nuke.Text_Knob('about', ' ', ABOUT % ('ODT',
+        'lin_ciexyzd65_display to and from the CIF display colorspaces, as in OCIO 2.')))
+    g['label'].setValue('[value direction] [value display]')
+    g['tile_color'].setValue(0x4a3a7aff)
+    return g
+
+
+def write_nk(path, nodes):
+    for n in nuke.allNodes():
+        n.setSelected(n in nodes)
+    nuke.nodeCopy(path)
+    lines = [l for l in open(path).read().splitlines()
+             if not l.startswith('version ') and l.strip() != 'selected true']
+    open(path, 'w').write('\n'.join(lines) + '\n')
+    print('wrote', path)
+
+
 def main():
     out = os.path.join(HERE, 'CLFBake.nk')
     s = build_shaper()
@@ -270,13 +377,8 @@ def main():
     g.setInput(0, s)
     s.setXYpos(0, 0)
     g.setXYpos(0, 200)
-    for n in nuke.allNodes():
-        n.setSelected(n in (s, g))
-    nuke.nodeCopy(out)
-    lines = [l for l in open(out).read().splitlines()
-             if not l.startswith('version ') and l.strip() != 'selected true']
-    open(out, 'w').write('\n'.join(lines) + '\n')
-    print('wrote', out)
+    write_nk(out, (s, g))
+    write_nk(os.path.join(HERE, 'ODT.nk'), (build_odt(),))
     splice_opendrt(os.path.normpath(OPENDRT), opendrt_knob_lines())
     print('spliced CLF Helpers into', os.path.normpath(OPENDRT))
 
